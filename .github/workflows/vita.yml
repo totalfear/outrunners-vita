@@ -22,13 +22,15 @@ jobs:
 
       - name: Install VitaSDK
         run: |
+          set -x
           sudo mkdir -p "$VITASDK"
-          sudo chown -R "$USER" "$VITASDK"
+          sudo chown -R "$(id -u):$(id -g)" "$VITASDK"
           git clone --depth 1 https://github.com/vitasdk/vdpm
           cd vdpm
           ./bootstrap-vitasdk.sh
           ./install-all.sh
           echo "$VITASDK/bin" >> "$GITHUB_PATH"
+          ls "$VITASDK/bin" | head -5
 
       - name: Apply the Vita patches (ports/vita), unless already applied
         run: |
