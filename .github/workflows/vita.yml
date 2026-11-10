@@ -29,7 +29,9 @@ jobs:
           export PATH="$VITASDK/bin:$PATH"
           echo "$VITASDK/bin" >> "$GITHUB_PATH"
           ls "$VITASDK/bin" | head -20
-          vdpm install sdl2    # (the only library the game needs beyond the SDK's own)
+          # (the only library the game needs beyond the SDK's own; it asks "Proceed? [Y/n]", which nobody can
+          # answer here: so "y" is sent, and pacman's own --noconfirm is the second try)
+          printf 'y\n' | vdpm install sdl2 || vdpm pacman -- -S --noconfirm sdl2
           ls "$VITASDK/arm-vita-eabi/lib" | grep -i sdl2 || echo "no SDL2 library found"
 
       - name: Apply the Vita patches (ports/vita), unless already applied
