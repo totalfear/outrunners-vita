@@ -13,7 +13,7 @@ jobs:
       run:
         shell: bash
     env:
-      VITASDK: /usr/local/vitasdk
+      VITASDK: /home/runner/vitasdk    # (the install script makes it itself, and stops if it is already there)
     steps:
       - name: Get the code
         uses: actions/checkout@v4
@@ -23,8 +23,6 @@ jobs:
       - name: Install VitaSDK
         run: |
           set -x
-          sudo mkdir -p "$VITASDK"
-          sudo chown -R "$(id -u):$(id -g)" "$VITASDK"
           git clone --depth 1 https://github.com/vitasdk/vdpm
           cd vdpm
           ./bootstrap-vitasdk.sh
