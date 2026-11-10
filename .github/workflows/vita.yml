@@ -1,0 +1,67 @@
+# Builds OutRunners for the PlayStation Vita (VitaSDK) on GitHub's servers: no ROM, no assets, only the game.
+# Run it by hand: the Actions tab > "Build Vita VPK" > Run workflow. Its VPK and its build log are in the
+# run's Artifacts when it ends (the log also when the build fails).
+name: Build Vita VPK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vita:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      VITASDK: /usr/local/vitasdk
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install VitaSDK
+        run: |
+          sudo mkdir -p "$VITASDK"
+          sudo chown -R "$USER" "$VITASDK"
+          git clone --depth 1 https://github.com/vitasdk/vdpm
+          cd vdpm
+          ./bootstrap-vitasdk.sh
+          ./install-all.sh
+          echo "$VITASDK/bin" >> "$GITHUB_PATH"
+
+      - name: Apply the Vita patches (ports/vita), unless already applied
+        run: |
+          for p in CMakeLists.top-level main.c tasks.c; do
+            if patch -p1 -R --dry-run -s < "ports/vita/$p.patch" > /dev/null 2>&1; then
+              echo "$p.patch is already applied"
+            else
+              patch -p1 < "ports/vita/$p.patch"
+            fi
+          done
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/vita -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DORUNNERS_VITA=ON -DCMAKE_BUILD_TYPE=Release -DORUNNERS_REFERENCE_TOOLS=OFF 2>&1 | tee configure.log
+
+      - name: Build
+        run: |
+          cmake --build build/vita --target OutRunners.vpk 2>&1 | tee build.log
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vita-build-logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
+
+      - name: Keep the VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OutRunners-vita-vpk
+          path: build/vita/OutRunners.vpk
