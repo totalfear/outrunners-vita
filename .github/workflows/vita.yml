@@ -26,9 +26,11 @@ jobs:
           git clone --depth 1 https://github.com/vitasdk/vdpm
           cd vdpm
           ./bootstrap-vitasdk.sh
-          ./install-all.sh
+          export PATH="$VITASDK/bin:$PATH"
           echo "$VITASDK/bin" >> "$GITHUB_PATH"
-          ls "$VITASDK/bin" | head -5
+          ls "$VITASDK/bin" | head -20
+          vdpm install sdl2    # (the only library the game needs beyond the SDK's own)
+          ls "$VITASDK/arm-vita-eabi/lib" | grep -i sdl2 || echo "no SDL2 library found"
 
       - name: Apply the Vita patches (ports/vita), unless already applied
         run: |
