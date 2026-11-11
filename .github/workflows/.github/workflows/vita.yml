@@ -1,0 +1,53 @@
+name: Build Vita VPK
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  VITASDK: /home/runner/vitasdk
+  PKG_CONFIG_PATH: /home/runner/vitasdk/arm-vita-eabi/lib/pkgconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake pkg-config python3
+
+      - name: Install VitaSDK and SDL2
+        run: |
+          git clone https://github.com/vitasdk/vdpm
+          cd vdpm
+          ./bootstrap-vitasdk.sh
+          ./vdpm sdl2
+
+      - name: Configure
+        run: |
+          export PATH=$VITASDK/bin:$PATH
+          cmake -S . -B build/vita -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
+            -DORUNNERS_VITA=ON \
+            -DORUNNERS_REFERENCE_TOOLS=OFF
+
+      - name: Build VPK
+        run: |
+          export PATH=$VITASDK/bin:$PATH
+          cmake --build build/vita --target OutRunners.vpk 2>&1 | tee build.log
+
+      - name: Save the VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OutRunners-vpk
+          path: build/vita/OutRunners.vpk
+
+      - name: Save the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
