@@ -1,5 +1,5 @@
 --- a/ports/sdl2/main.c	2026-11-10 23:15:41.537827149 +0000
-+++ b/ports/sdl2/main.c	2026-11-10 23:15:41.547604894 +0000
++++ b/ports/sdl2/main.c	2026-11-11 05:21:45.571028229 +0000
 @@ -91,7 +91,11 @@
  #include <sys/stat.h>
  #define SWITCH_FOLDER "sdmc:/switch/outrunners"    /* the game's folder on the SD card */
@@ -22,7 +22,35 @@
  #else
  #define VIDEO_WORKERS       SDL_min(SDL_GetCPUCount() - 1, 3)    /* up to three more cores (a handheld's four) */
  #endif
-@@ -1770,7 +1776,7 @@
+@@ -157,6 +163,27 @@
+ static SDL_Renderer *renderer;
+ static SDL_Texture *texture;
+ static SDL_AudioDeviceID audio;
++#ifdef __vita__
++static SDL_AudioStream *audio_resampler;    /* the mix's rate to the 48000 Hz the Vita's audio takes, when it does not take it */
++#endif
++
++/* The mix to the device's queue (through the resampler on the Vita, when there is one) */
++static void queue_audio(const void *data, Uint32 bytes)
++{
++#ifdef __vita__
++	if (audio_resampler)
++	{
++		Uint8 converted[8192];
++		int got;
++
++		if (SDL_AudioStreamPut(audio_resampler, data, (int)bytes) == 0)
++			while ((got = SDL_AudioStreamGet(audio_resampler, converted, sizeof(converted))) > 0)
++				SDL_QueueAudio(audio, converted, (Uint32)got);
++		return;
++	}
++#endif
++	SDL_QueueAudio(audio, data, bytes);
++}
+ static SDL_GameController *controllers[PLAYERS];
+ static bool smooth;
+ static uint64_t next_frame;           /* performance counter value the next frame waits for */
+@@ -1770,7 +1797,7 @@
  static void log_written(void)
  {
  	fflush(stderr);
@@ -31,7 +59,16 @@
  	fsync(fileno(stderr));
  #endif
  }
-@@ -1942,6 +1948,9 @@
+@@ -1869,7 +1896,7 @@
+ 	}
+ #endif
+ 	if (audio && !fast && SDL_GetQueuedAudioSize(audio) < sound_chips_mix_rate() / S32_FRAME_RATE * 4 * QUEUE_FRAMES_MAX)
+-		SDL_QueueAudio(audio, mix, (Uint32)(count * 2 * sizeof(int16_t)));
++		queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));
+ 	if (sound_hashes)
+ 		fprintf(sound_hashes, "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame, sound_chips_frame_hash(),
+ 			sound_board_state_hash());
+@@ -1942,6 +1969,9 @@
  #ifdef __SWITCH__
  	mkdir(SWITCH_FOLDER, 0777);
  	return SDL_strdup(SWITCH_FOLDER "/");
@@ -41,7 +78,7 @@
  #elif defined(__ANDROID__)
  	return SDL_GetPrefPath("", "OutRunners");    /* (the app's own folder, its internal storage) */
  #elif defined(_WIN32) || defined(ORUNNERS_HANDHELD)
-@@ -2066,6 +2075,13 @@
+@@ -2066,6 +2096,13 @@
  	freopen(SWITCH_FOLDER "/outrunners.log", "w", stderr);
  	fprintf(stderr, "OutRunners: starting\n");
  #endif
@@ -55,7 +92,7 @@
  #ifdef __ANDROID__
  	/* (what the game says goes to outrunners.log in the app's folder on the storage, Android/data/<the
  	   app>/files: stderr goes nowhere there) */
-@@ -2259,6 +2275,9 @@
+@@ -2259,6 +2296,9 @@
  #ifdef __SWITCH__
  	/* (the Switch's screen, 1280 x 720; docked, the system shows it at the TV's size) */
  	window = SDL_CreateWindow(TITLE, 0, 0, 1280, 720, 0);
@@ -65,3 +102,62 @@
  #elif defined(ORUNNERS_HANDHELD)
  	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);
  #else
+@@ -2269,7 +2309,24 @@
+ 	if (window)
+ 		apply_window_settings();
+ #endif
++#ifdef __vita__
++	/* SDL lists the Vita's GLES2 renderer before its GXM one, and the GLES2 one compiles its shaders as it runs,
++	   with libshacccg.suprx: a file of the Vita's firmware that not every setup has (and Vita3K has not). The GXM
++	   renderer has its shaders built in and needs nothing */
++	renderer = NULL;
++	for (int driver = 0; window && !renderer && driver < SDL_GetNumRenderDrivers(); driver++)
++	{
++		SDL_RendererInfo driver_info;
++
++		if (SDL_GetRenderDriverInfo(driver, &driver_info) == 0 && driver_info.name
++			&& (SDL_strstr(driver_info.name, "gxm") || SDL_strstr(driver_info.name, "GXM")))
++			renderer = SDL_CreateRenderer(window, driver, 0);
++	}
++	if (window && !renderer)
++		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
++#else
+ 	renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
++#endif
+ 	if (window && !renderer)
+ 		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+ 	texture = renderer ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+@@ -2290,6 +2347,22 @@
+ 	wanted.channels = 2;
+ 	wanted.samples = 1024;
+ 	audio = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
++#ifdef __vita__
++	if (!audio)
++	{
++		/* (the Vita's audio takes 48000 Hz and a few lower rates, not the chips' own: the mix goes through a
++		   stream that takes it to 48000) */
++		wanted.freq = 48000;
++		audio = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
++		if (audio)
++			audio_resampler = SDL_NewAudioStream(AUDIO_S16SYS, 2, (int)sound_chips_mix_rate(), AUDIO_S16SYS, 2, 48000);
++		if (audio && !audio_resampler)
++		{
++			SDL_CloseAudioDevice(audio);
++			audio = 0;
++		}
++	}
++#endif
+ 	if (audio)
+ 		SDL_PauseAudioDevice(audio, 0);
+ 
+@@ -2337,6 +2410,10 @@
+ 		fclose(sound_hashes);
+ 	if (audio)
+ 		SDL_CloseAudioDevice(audio);
++#ifdef __vita__
++	if (audio_resampler)
++		SDL_FreeAudioStream(audio_resampler);
++#endif
+ 	if (vsync_on && program_frames() > 1)
+ 		fprintf(stderr, "vsync: %u of %" PRIu64 " frames left out, behind the game's pace; %.3f frames a second\n",
+ 			frames_left_out, program_frames(), (double)(program_frames() - 1) * (double)SDL_GetPerformanceFrequency()
