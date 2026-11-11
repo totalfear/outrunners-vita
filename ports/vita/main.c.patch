@@ -1,0 +1,67 @@
+--- a/ports/sdl2/main.c	2026-11-10 23:15:41.537827149 +0000
++++ b/ports/sdl2/main.c	2026-11-10 23:15:41.547604894 +0000
+@@ -91,7 +91,11 @@
+ #include <sys/stat.h>
+ #define SWITCH_FOLDER "sdmc:/switch/outrunners"    /* the game's folder on the SD card */
+ #endif
+-#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__)
++#ifdef __vita__
++#include <sys/stat.h>      /* mkdir */
++#define VITA_FOLDER "ux0:data/OutRunners"    /* the game's folder on the memory card: its assets pack, what it writes */
++#endif
++#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+ #include <unistd.h>        /* fsync: the log on the card as it is written */
+ #endif
+ 
+@@ -126,6 +130,8 @@
+ #define ASSETS_PACK         "outrunners.assets"    /* the assets in one file (game/assets.h), the devices' */
+ #ifdef __SWITCH__
+ #define VIDEO_WORKERS       2          /* the video's rows on cores 1 and 2 (the game's is 0; 3 is the system's) */
++#elif defined(__vita__)
++#define VIDEO_WORKERS       2          /* (the Vita's cores beside the game's: tune it with outrunners.log's pace) */
+ #else
+ #define VIDEO_WORKERS       SDL_min(SDL_GetCPUCount() - 1, 3)    /* up to three more cores (a handheld's four) */
+ #endif
+@@ -1770,7 +1776,7 @@
+ static void log_written(void)
+ {
+ 	fflush(stderr);
+-#if !defined(_WIN32) && !defined(__SWITCH__)
++#if !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+ 	fsync(fileno(stderr));
+ #endif
+ }
+@@ -1942,6 +1948,9 @@
+ #ifdef __SWITCH__
+ 	mkdir(SWITCH_FOLDER, 0777);
+ 	return SDL_strdup(SWITCH_FOLDER "/");
++#elif defined(__vita__)
++	mkdir(VITA_FOLDER, 0777);
++	return SDL_strdup(VITA_FOLDER "/");
+ #elif defined(__ANDROID__)
+ 	return SDL_GetPrefPath("", "OutRunners");    /* (the app's own folder, its internal storage) */
+ #elif defined(_WIN32) || defined(ORUNNERS_HANDHELD)
+@@ -2066,6 +2075,13 @@
+ 	freopen(SWITCH_FOLDER "/outrunners.log", "w", stderr);
+ 	fprintf(stderr, "OutRunners: starting\n");
+ #endif
++#ifdef __vita__
++	/* (what the game says, failures included, goes to outrunners.log in its folder on the card: the Vita has no
++	   console to read it on) */
++	mkdir(VITA_FOLDER, 0777);
++	freopen(VITA_FOLDER "/outrunners.log", "w", stderr);
++	fprintf(stderr, "OutRunners: starting\n");
++#endif
+ #ifdef __ANDROID__
+ 	/* (what the game says goes to outrunners.log in the app's folder on the storage, Android/data/<the
+ 	   app>/files: stderr goes nowhere there) */
+@@ -2259,6 +2275,9 @@
+ #ifdef __SWITCH__
+ 	/* (the Switch's screen, 1280 x 720; docked, the system shows it at the TV's size) */
+ 	window = SDL_CreateWindow(TITLE, 0, 0, 1280, 720, 0);
++#elif defined(__vita__)
++	/* (the Vita's screen, 960 x 544: the system shows the window as all of it) */
++	window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);
+ #elif defined(ORUNNERS_HANDHELD)
+ 	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);
+ #else

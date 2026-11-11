@@ -1,0 +1,123 @@
+--- a/runtime/src/tasks.c	2026-11-10 23:19:54.224251627 +0000
++++ b/runtime/src/tasks.c	2026-11-10 23:19:54.259743605 +0000
+@@ -1,7 +1,8 @@
+ /**
+  *    Name:        tasks.c
+  *    Description: native stacks for the game's tasks (host/tasks.h): fibers on Windows, the registers on the
+- *                 task's stack on the Switch and Android (aarch64), ucontext elsewhere
++ *                 task's stack on the Switch and Android (aarch64) and on the Vita (32-bit ARM), ucontext
++ *                 elsewhere
+  *    Version:     0.1.0
+  *    Created:     20-10-2026
+  *    Modified:    30-10-2026
+@@ -20,7 +21,11 @@
+ #include <string.h>
+ 
+ /* the C of a task nests as deep as the game's calls do, with the locals of the generated code */
++#ifdef __vita__
++#define TASK_STACK_SIZE (4u << 20)     /* (the Vita's memory is 256 MB in all: less than the others' 16 MB each) */
++#else
+ #define TASK_STACK_SIZE (16u << 20)
++#endif
+ 
+ #ifdef _WIN32
+ 
+@@ -168,6 +173,98 @@
+ 	task->stack_pointer = registers;
+ 	return task;
+ }
++
++void host_task_switch(host_task *to)
++{
++	host_task *from = current;
++
++	if (to == from)
++		return;
++	current = to;
++	host_switch_stacks(&from->stack_pointer, to->stack_pointer);
++}
++
++#elif defined(__vita__)
++
++/* The Vita's C library has no ucontext either: as on the aarch64 above, a task's registers are kept on its own
++   stack. What a call keeps for its caller (AAPCS: r4-r11, the return address lr, d8-d15) is pushed where the
++   task stops and popped where it goes on; the stack pointer is all the task keeps beside it. The routine is
++   assembled as ARM code whichever the file is (and the mode put back after it), with no instruction that
++   Thumb-2 would take for another (SP stored with a plain str) */
++#define SAVED_WORDS 25    /* d8-d15 (16 words, lowest), r4-r11 (8), lr (the highest) */
++
++void host_switch_stacks(void **from_stack, void *to_stack);
++
++__asm__(
++	".text\n"
++	".arm\n"
++	".align 2\n"
++	".global host_switch_stacks\n"
++	".type host_switch_stacks, %function\n"
++	"host_switch_stacks:\n"
++	"	push {r4-r11, lr}\n"
++	"	vpush {d8-d15}\n"
++	"	mov r2, sp\n"
++	"	str r2, [r0]\n"
++	"	mov sp, r1\n"
++	"	vpop {d8-d15}\n"
++	"	pop {r4-r11, lr}\n"
++	"	bx lr\n"
++	".size host_switch_stacks, .-host_switch_stacks\n"
++#ifdef __thumb__
++	".thumb\n"
++#else
++	".arm\n"
++#endif
++);
++
++struct host_task
++{
++	void *stack_pointer;    /* where it stopped: its registers on top */
++	void *stack;
++	void (*start)(void);
++};
++
++static host_task main_task;
++static host_task *current;
++
++host_task *host_task_main(void)
++{
++	if (!current)
++		current = &main_task;
++	return &main_task;
++}
++
++static void run_task(void)
++{
++	current->start();
++	fprintf(stderr, "A task came to its end\n");
++	exit(3);
++}
++
++host_task *host_task_create(void (*start)(void))
++{
++	host_task *task = calloc(1, sizeof(*task));
++	uintptr_t top;
++	uint32_t *registers;
++
++	if (task)
++		task->stack = malloc(TASK_STACK_SIZE);
++	if (!task || !task->stack)
++	{
++		fprintf(stderr, "A task could not be created\n");
++		exit(3);
++	}
++	task->start = start;
++	/* its first switch pops registers that return into run_task, and leaves the stack pointer at the top of
++	   its stack, 8-byte aligned as a call wants it */
++	top = ((uintptr_t)task->stack + TASK_STACK_SIZE) & ~(uintptr_t)7;
++	registers = (uint32_t *)(top - SAVED_WORDS * sizeof(uint32_t));
++	memset(registers, 0, SAVED_WORDS * sizeof(uint32_t));
++	registers[SAVED_WORDS - 1] = (uint32_t)(uintptr_t)run_task;    /* (lr: where the first bx goes) */
++	task->stack_pointer = registers;
++	return task;
++}
+ 
+ void host_task_switch(host_task *to)
+ {
