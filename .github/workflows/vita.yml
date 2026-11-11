@@ -34,13 +34,69 @@ jobs:
           printf 'y\n' | vdpm install sdl2 || vdpm pacman -- -S --noconfirm sdl2
           ls "$VITASDK/arm-vita-eabi/lib" | grep -i sdl2 || echo "no SDL2 library found"
 
-      - name: Apply the Vita patches (ports/vita), unless already applied
+      - name: Apply the Vita changes to the source
         run: |
-          for p in CMakeLists.top-level main.c tasks.c; do
-            if patch -p1 -R --dry-run -s < "ports/vita/$p.patch" > /dev/null 2>&1; then
+          # CMakeLists.txt: edited by the lines' text, not by line numbers (a patch breaks when the file moves)
+          python3 - <<'PYEOF'
+          import re, sys
+
+          path = "CMakeLists.txt"
+          s = open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+          problems = []
+
+          # 1. the option, before the first option() of the file
+          if "option(ORUNNERS_VITA" not in s:
+              m = re.search(r"^option\(", s, re.M)
+              if m:
+                  s = s[:m.start()] + 'option(ORUNNERS_VITA "Build the game for the PlayStation Vita (VitaSDK, ports/vita)" OFF)\n\n' + s[m.start():]
+              else:
+                  problems.append("no option( line to put ORUNNERS_VITA before")
+
+          # 2. the computer-only tools (the maker, the headless runs) are not for the Vita
+          if "NOT ORUNNERS_VITA" not in s:
+              s, n = re.subn(r"(NOT ORUNNERS_ANBERNIC)( AND NOT ANDROID)", r"\1 AND NOT ORUNNERS_VITA\2", s)
+              if n == 0:
+                  problems.append("no 'NOT ORUNNERS_ANBERNIC AND NOT ANDROID' condition found")
+
+          # 3. the device dispatch: the Vita's file after the Anbernic's
+          if "ports/vita/vita.cmake" not in s:
+              s, n = re.subn(r"(elseif\(ORUNNERS_ANBERNIC\)\s*\n[ \t]*include\([^)\n]*anbernic\.cmake\)[ \t]*\n)",
+                             r"\1\telseif(ORUNNERS_VITA)\n\t\tinclude(${CMAKE_SOURCE_DIR}/ports/vita/vita.cmake)\n", s)
+              if n == 0:
+                  problems.append("no 'elseif(ORUNNERS_ANBERNIC) include(...anbernic.cmake)' dispatch found")
+
+          # 4. the desktop's SDL2 lookup is not for the Vita
+          if "ORUNNERS_ANBERNIC OR ORUNNERS_VITA" not in s:
+              s, n = re.subn(r"if\(ORUNNERS_ANBERNIC OR ORUNNERS_SWITCH OR ANDROID\)", "if(ORUNNERS_ANBERNIC OR ORUNNERS_VITA OR ORUNNERS_SWITCH OR ANDROID)", s)
+              if n == 0:
+                  problems.append("no 'if(ORUNNERS_ANBERNIC OR ORUNNERS_SWITCH OR ANDROID)' SDL2 condition found")
+
+          if problems:
+              print("CMakeLists.txt does not look as expected:")
+              for p in problems:
+                  print("  -", p)
+              print("the lines that name the devices, for a look:")
+              for i, line in enumerate(s.split("\n"), 1):
+                  if "ORUNNERS_ANBERNIC" in line or "ORUNNERS_SWITCH" in line or "ORUNNERS_VITA" in line:
+                      print("%5d: %s" % (i, line))
+              sys.exit(1)
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              open(path, "w", encoding="utf-8", newline="").write(s)
+              print("CMakeLists.txt: the Vita edits are in")
+          else:
+              print("CMakeLists.txt: the Vita edits were already in")
+          PYEOF
+          # main.c and tasks.c: patches, with white space (tabs or spaces) not counted, unless already applied
+          for p in main.c tasks.c; do
+            if patch -p1 -l -R --dry-run -s < "ports/vita/$p.patch" > /dev/null 2>&1; then
               echo "$p.patch is already applied"
             else
-              patch -p1 < "ports/vita/$p.patch"
+              patch -p1 -l < "ports/vita/$p.patch"
             fi
           done
 
