@@ -19,7 +19,7 @@ pkg_check_modules(SDL2 REQUIRED sdl2)
 
 add_executable(OutRunners ports/sdl2/main.c ports/sdl2/forces.c ports/sdl2/controls.c ports/vita/vita_runtime.c)
 target_include_directories(OutRunners PRIVATE ${SDL2_INCLUDE_DIRS})
-target_link_libraries(OutRunners PRIVATE orunners_game_console orunners_sound ${SDL2_LIBRARIES} ScePower_stub pthread m)
+target_link_libraries(OutRunners PRIVATE orunners_game_console orunners_sound ${SDL2_LIBRARIES} ScePower_stub pthread m stdc++)
 
 # vita_create_self looks for the ELF in this folder. CMakeLists.txt sends every executable to build/bin through
 # the plain and the per-configuration variables (Release is the default), and a per-configuration property
