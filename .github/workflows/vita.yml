@@ -36,8 +36,8 @@ jobs:
 
       - name: Apply the Vita changes to the source
         run: |
-          # CMakeLists.txt and main.c: edited by the lines' text, each edit only if it is not in yet (so it does
-          # not matter if the repository has the sources as they were, or with an earlier version of these edits)
+          # CMakeLists.txt, main.c and tasks.c: edited by the lines' text, each edit only if it is not in yet (so it
+          # does not matter if the repository has the sources as they were, or with an earlier version of these edits)
           python3 - <<'CMAKE_EDITS'
           import re, sys
 
@@ -297,12 +297,155 @@ jobs:
           else:
               print("ports/sdl2/main.c: the Vita edits were already in")
           MAIN_EDITS
-          # tasks.c: a patch, white space (tabs or spaces) not counted, unless already applied
-          if patch -p1 -l -R --dry-run -s < ports/vita/tasks.c.patch > /dev/null 2>&1; then
-            echo "tasks.c.patch is already applied"
-          else
-            patch -p1 -l < ports/vita/tasks.c.patch
-          fi
+          python3 - <<'TASKS_EDITS'
+          import re, sys
+
+          path = "runtime/src/tasks.c"
+          s = open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+          problems = []
+          done = []
+
+          VITA_BRANCH = r"""#elif defined(__vita__)
+
+          /* The Vita's C library has no ucontext either: as on the aarch64 above, a task's registers are kept on its own
+             stack. What a call keeps for its caller (AAPCS: r4-r11, the return address lr, d8-d15) is pushed where the
+             task stops and popped where it goes on; the stack pointer is all the task keeps beside it. The routine is
+             assembled as ARM code whichever the file is (and the mode put back after it), with no instruction that
+             Thumb-2 would take for another (SP stored with a plain str) */
+          #define SAVED_WORDS 25    /* d8-d15 (16 words, lowest), r4-r11 (8), lr (the highest) */
+
+          void host_switch_stacks(void **from_stack, void *to_stack);
+
+          __asm__(
+          	".text\n"
+          	".arm\n"
+          	".align 2\n"
+          	".global host_switch_stacks\n"
+          	".type host_switch_stacks, %function\n"
+          	"host_switch_stacks:\n"
+          	"	push {r4-r11, lr}\n"
+          	"	vpush {d8-d15}\n"
+          	"	mov r2, sp\n"
+          	"	str r2, [r0]\n"
+          	"	mov sp, r1\n"
+          	"	vpop {d8-d15}\n"
+          	"	pop {r4-r11, lr}\n"
+          	"	bx lr\n"
+          	".size host_switch_stacks, .-host_switch_stacks\n"
+          #ifdef __thumb__
+          	".thumb\n"
+          #else
+          	".arm\n"
+          #endif
+          );
+
+          struct host_task
+          {
+          	void *stack_pointer;    /* where it stopped: its registers on top */
+          	void *stack;
+          	void (*start)(void);
+          };
+
+          static host_task main_task;
+          static host_task *current;
+
+          host_task *host_task_main(void)
+          {
+          	if (!current)
+          		current = &main_task;
+          	return &main_task;
+          }
+
+          static void run_task(void)
+          {
+          	current->start();
+          	fprintf(stderr, "A task came to its end\n");
+          	exit(3);
+          }
+
+          host_task *host_task_create(void (*start)(void))
+          {
+          	host_task *task = calloc(1, sizeof(*task));
+          	uintptr_t top;
+          	uint32_t *registers;
+
+          	if (task)
+          		task->stack = malloc(TASK_STACK_SIZE);
+          	if (!task || !task->stack)
+          	{
+          		fprintf(stderr, "A task could not be created\n");
+          		exit(3);
+          	}
+          	task->start = start;
+          	/* its first switch pops registers that return into run_task, and leaves the stack pointer at the top of
+          	   its stack, 8-byte aligned as a call wants it */
+          	top = ((uintptr_t)task->stack + TASK_STACK_SIZE) & ~(uintptr_t)7;
+          	registers = (uint32_t *)(top - SAVED_WORDS * sizeof(uint32_t));
+          	memset(registers, 0, SAVED_WORDS * sizeof(uint32_t));
+          	registers[SAVED_WORDS - 1] = (uint32_t)(uintptr_t)run_task;    /* (lr: where the first bx goes) */
+          	task->stack_pointer = registers;
+          	return task;
+          }
+
+          void host_task_switch(host_task *to)
+          {
+          	host_task *from = current;
+
+          	if (to == from)
+          		return;
+          	current = to;
+          	host_switch_stacks(&from->stack_pointer, to->stack_pointer);
+          }
+
+          """
+
+          # 1. the Vita's stack size for a task: its memory is 256 MB in all, not 16 MB for each task
+          if re.search(r"#\s*(ifdef\s+__vita__|if\s+defined\(\s*__vita__\s*\))\s*\n\s*#\s*define\s+TASK_STACK_SIZE", s):
+              done.append("stack size: already in")
+          else:
+              s, n = re.subn(r"(?m)^#define TASK_STACK_SIZE \(16u << 20\)[ \t]*\n",
+                  "#ifdef __vita__\n#define TASK_STACK_SIZE (4u << 20)     /* (the Vita's memory is 256 MB in all: less than the others' 16 MB each) */\n#else\n#define TASK_STACK_SIZE (16u << 20)\n#endif\n", s, count=1)
+              if n == 1:
+                  done.append("stack size: added")
+              else:
+                  problems.append("stack size: no '#define TASK_STACK_SIZE (16u << 20)' line found")
+
+          # 2. the Vita's task switch: its registers kept on the task's own stack (its C library has no ucontext)
+          if re.search(r"#\s*elif\s+defined\(\s*__vita__\s*\)", s) or "r4-r11" in s:
+              done.append("Vita task switch: already in")
+          else:
+              s, n = re.subn(r"(?m)^#else[ \t]*\n[ \t]*\n#include <ucontext\.h>", lambda m: VITA_BRANCH + "#else\n\n#include <ucontext.h>", s, count=1)
+              if n == 1:
+                  done.append("Vita task switch: added")
+              else:
+                  problems.append("Vita task switch: no '#else / #include <ucontext.h>' branch found to put it before")
+
+          for line in done:
+              print("  " + line)
+          print("the Vita lines of tasks.c now:")
+          for i, line in enumerate(s.split("\n"), 1):
+              if "__vita__" in line or "TASK_STACK_SIZE" in line or "r4-r11" in line or "host_switch_stacks:" in line:
+                  print("%5d: %s" % (i, line.strip()[:110]))
+          if problems:
+              print("tasks.c does not look as expected:")
+              for p in problems:
+                  print("  -", p)
+              print("its #if lines, for a look:")
+              for i, line in enumerate(s.split("\n"), 1):
+                  if re.match(r"\s*#\s*(if|elif|else|endif)", line):
+                      print("%5d: %s" % (i, line.strip()[:110]))
+              sys.exit(1)
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              open(path, "w", encoding="utf-8", newline="").write(s)
+              print("runtime/src/tasks.c: the Vita edits are in")
+          else:
+              print("runtime/src/tasks.c: the Vita edits were already in")
+          TASKS_EDITS
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
