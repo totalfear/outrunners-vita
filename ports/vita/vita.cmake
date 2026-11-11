@@ -32,6 +32,6 @@ endforeach()
 
 vita_create_self(OutRunners.self OutRunners)
 vita_create_vpk(OutRunners.vpk ORUN00001 OutRunners.self
-	VERSION 01.00 NAME "OutRunners"
+	VERSION 01.01 NAME "OutRunners"
 	FILE ${CMAKE_SOURCE_DIR}/ports/vita/sce_sys sce_sys
 	FILE ${CMAKE_SOURCE_DIR}/ports/sdl2/prompts/input_prompts.bmp input_prompts.bmp)
