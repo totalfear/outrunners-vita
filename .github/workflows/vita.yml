@@ -36,8 +36,9 @@ jobs:
 
       - name: Apply the Vita changes to the source
         run: |
-          # CMakeLists.txt: edited by the lines' text, not by line numbers (a patch breaks when the file moves)
-          python3 - <<'PYEOF'
+          # CMakeLists.txt and main.c: edited by the lines' text, each edit only if it is not in yet (so it does
+          # not matter if the repository has the sources as they were, or with an earlier version of these edits)
+          python3 - <<'CMAKE_EDITS'
           import re, sys
 
           path = "CMakeLists.txt"
@@ -90,15 +91,209 @@ jobs:
               print("CMakeLists.txt: the Vita edits are in")
           else:
               print("CMakeLists.txt: the Vita edits were already in")
-          PYEOF
-          # main.c and tasks.c: patches, with white space (tabs or spaces) not counted, unless already applied
-          for p in main.c tasks.c; do
-            if patch -p1 -l -R --dry-run -s < "ports/vita/$p.patch" > /dev/null 2>&1; then
-              echo "$p.patch is already applied"
-            else
-              patch -p1 -l < "ports/vita/$p.patch"
-            fi
-          done
+          CMAKE_EDITS
+          python3 - <<'MAIN_EDITS'
+          import re, sys
+
+          path = "ports/sdl2/main.c"
+          s = open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+
+          def norm(t):
+              return re.sub(r"\s+", " ", t)
+
+          def pattern(old):
+              body = r"\s+".join(re.escape(t) for t in old.split())
+              return re.compile(r"(?m)^[ \t]*" + body + (r"[ \t]*\n" if old.endswith("\n") else ""))
+
+          # (name, a piece of the NEW text that says the edit is in, the OLD text it replaces, the NEW text)
+          EDITS = []
+          def edit(name, marker, old, new):
+              EDITS.append((name, marker, old, new))
+
+          edit("folder and includes", 'VITA_FOLDER "ux0:data/OutRunners"',
+          '''#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__)
+          #include <unistd.h>        /* fsync: the log on the card as it is written */
+          #endif
+          ''','''#ifdef __vita__
+          #include <sys/stat.h>      /* mkdir */
+          #define VITA_FOLDER "ux0:data/OutRunners"    /* the game's folder on the memory card: its assets pack, what it writes */
+          #endif
+          #if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+          #include <unistd.h>        /* fsync: the log on the card as it is written */
+          #endif
+          ''')
+
+          edit("video workers", '#elif defined(__vita__) #define VIDEO_WORKERS',
+          '''#else
+          #define VIDEO_WORKERS       SDL_min(SDL_GetCPUCount() - 1, 3)''','''#elif defined(__vita__)
+          #define VIDEO_WORKERS       2          /* (the Vita's cores beside the game's: tune it with outrunners.log's pace) */
+          #else
+          #define VIDEO_WORKERS       SDL_min(SDL_GetCPUCount() - 1, 3)''')
+
+          edit("fsync", '!defined(__SWITCH__) && !defined(__vita__) fsync(fileno(stderr));',
+          '''	fflush(stderr);
+          #if !defined(_WIN32) && !defined(__SWITCH__)
+          	fsync(fileno(stderr));''','''	fflush(stderr);
+          #if !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+          	fsync(fileno(stderr));''')
+
+          edit("saves folder", 'mkdir(VITA_FOLDER, 0777); return SDL_strdup(VITA_FOLDER "/");',
+          '''	return SDL_strdup(SWITCH_FOLDER "/");
+          #elif defined(__ANDROID__)''','''	return SDL_strdup(SWITCH_FOLDER "/");
+          #elif defined(__vita__)
+          	mkdir(VITA_FOLDER, 0777);
+          	return SDL_strdup(VITA_FOLDER "/");
+          #elif defined(__ANDROID__)''')
+
+          edit("log file", 'freopen(VITA_FOLDER "/outrunners.log", "w", stderr);',
+          '''#ifdef __ANDROID__
+          	/* (what the game says goes to outrunners.log in the app's folder''','''#ifdef __vita__
+          	/* (what the game says, failures included, goes to outrunners.log in its folder on the card: the Vita has no
+          	   console to read it on) */
+          	mkdir(VITA_FOLDER, 0777);
+          	freopen(VITA_FOLDER "/outrunners.log", "w", stderr);
+          	fprintf(stderr, "OutRunners: starting\\n");
+          #endif
+          #ifdef __ANDROID__
+          	/* (what the game says goes to outrunners.log in the app's folder''')
+
+          edit("window", 'window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);',
+          '''#elif defined(ORUNNERS_HANDHELD)
+          	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''','''#elif defined(__vita__)
+          	/* (the Vita's screen, 960 x 544: the system shows the window as all of it) */
+          	window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);
+          #elif defined(ORUNNERS_HANDHELD)
+          	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''')
+
+          edit("audio helper", 'static void queue_audio(const void *data, Uint32 bytes)',
+          '''static SDL_AudioDeviceID audio;
+          ''','''static SDL_AudioDeviceID audio;
+          #ifdef __vita__
+          static SDL_AudioStream *audio_resampler;    /* the mix's rate to the 48000 Hz the Vita's audio takes, when it does not take it */
+          #endif
+
+          /* The mix to the device's queue (through the resampler on the Vita, when there is one) */
+          static void queue_audio(const void *data, Uint32 bytes)
+          {
+          #ifdef __vita__
+          	if (audio_resampler)
+          	{
+          		Uint8 converted[8192];
+          		int got;
+
+          		if (SDL_AudioStreamPut(audio_resampler, data, (int)bytes) == 0)
+          			while ((got = SDL_AudioStreamGet(audio_resampler, converted, sizeof(converted))) > 0)
+          				SDL_QueueAudio(audio, converted, (Uint32)got);
+          		return;
+          	}
+          #endif
+          	SDL_QueueAudio(audio, data, bytes);
+          }
+          ''')
+
+          edit("queue the mix", 'queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));',
+          '''		SDL_QueueAudio(audio, mix, (Uint32)(count * 2 * sizeof(int16_t)));''','''		queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));''')
+
+          edit("audio open", 'audio_resampler = SDL_NewAudioStream(',
+          '''	audio = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
+          	if (audio)
+          		SDL_PauseAudioDevice(audio, 0);
+          ''','''	audio = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
+          #ifdef __vita__
+          	if (!audio)
+          	{
+          		/* (the Vita's audio takes 48000 Hz and a few lower rates, not the chips' own: the mix goes through a
+          		   stream that takes it to 48000) */
+          		wanted.freq = 48000;
+          		audio = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
+          		if (audio)
+          			audio_resampler = SDL_NewAudioStream(AUDIO_S16SYS, 2, (int)sound_chips_mix_rate(), AUDIO_S16SYS, 2, 48000);
+          		if (audio && !audio_resampler)
+          		{
+          			SDL_CloseAudioDevice(audio);
+          			audio = 0;
+          		}
+          	}
+          #endif
+          	if (audio)
+          		SDL_PauseAudioDevice(audio, 0);
+          ''')
+
+          edit("audio close", 'SDL_FreeAudioStream(audio_resampler);',
+          '''	if (audio)
+          		SDL_CloseAudioDevice(audio);
+          ''','''	if (audio)
+          		SDL_CloseAudioDevice(audio);
+          #ifdef __vita__
+          	if (audio_resampler)
+          		SDL_FreeAudioStream(audio_resampler);
+          #endif
+          ''')
+
+          edit("renderer", 'SDL lists the Vita',
+          '''	renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
+          ''','''#ifdef __vita__
+          	/* SDL lists the Vita's GLES2 renderer before its GXM one, and the GLES2 one compiles its shaders as it runs,
+          	   with libshacccg.suprx: a file of the Vita's firmware that not every setup has (and Vita3K has not). The GXM
+          	   renderer has its shaders built in and needs nothing */
+          	renderer = NULL;
+          	for (int driver = 0; window && !renderer && driver < SDL_GetNumRenderDrivers(); driver++)
+          	{
+          		SDL_RendererInfo driver_info;
+
+          		if (SDL_GetRenderDriverInfo(driver, &driver_info) == 0 && driver_info.name
+          			&& (SDL_strstr(driver_info.name, "gxm") || SDL_strstr(driver_info.name, "GXM")))
+          			renderer = SDL_CreateRenderer(window, driver, 0);
+          	}
+          	if (window && !renderer)
+          		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+          #else
+          	renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
+          #endif
+          ''')
+
+          problems = []
+          done = []
+          for name, marker, old, new in EDITS:
+              if norm(marker) in norm(s):
+                  done.append(name + ": already in")
+                  continue
+              pat = pattern(old)
+              found = pat.findall(s)
+              if len(found) != 1:
+                  problems.append("%s: the text to change was found %d times (wanted 1)" % (name, len(found)))
+                  continue
+              s = pat.sub(lambda m: new, s, count=1)
+              done.append(name + ": added")
+
+          for line in done:
+              print("  " + line)
+          if problems:
+              print("main.c does not look as expected:")
+              for p in problems:
+                  print("  -", p)
+              print("the lines with SDL_CreateRenderer / SDL_OpenAudioDevice / SDL_QueueAudio, for a look:")
+              for i, line in enumerate(s.split("\n"), 1):
+                  if "SDL_CreateRenderer" in line or "SDL_OpenAudioDevice" in line or "SDL_QueueAudio" in line or "VITA_FOLDER" in line:
+                      print("%5d: %s" % (i, line))
+              sys.exit(1)
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              open(path, "w", encoding="utf-8", newline="").write(s)
+              print("ports/sdl2/main.c: the Vita edits are in")
+          else:
+              print("ports/sdl2/main.c: the Vita edits were already in")
+          MAIN_EDITS
+          # tasks.c: a patch, white space (tabs or spaces) not counted, unless already applied
+          if patch -p1 -l -R --dry-run -s < ports/vita/tasks.c.patch > /dev/null 2>&1; then
+            echo "tasks.c.patch is already applied"
+          else
+            patch -p1 -l < ports/vita/tasks.c.patch
+          fi
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
