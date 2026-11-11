@@ -1,60 +1,80 @@
+# Builds OutRunners for the PlayStation Vita (VitaSDK) on GitHub's servers: no ROM, no assets, only the game.
+# Run it by hand: the Actions tab > "Build Vita VPK" > Run workflow. Its VPK and its build log are in the
+# run's Artifacts when it ends (the log also when the build fails).
 name: Build Vita VPK
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    container: vitasdk/vitasdk:latest
+  vita:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     env:
-      VITASDK: /usr/local/vitasdk
-      PKG_CONFIG_PATH: /usr/local/vitasdk/arm-vita-eabi/lib/pkgconfig
+      VITASDK: /home/runner/vitasdk    # (the install script makes it itself, and stops if it is already there)
     steps:
-      - name: Tools
-        run: |
-          apt-get update
-          apt-get install -y ninja-build pkg-config python3 git
-
-      - uses: actions/checkout@v7
+      - name: Get the code
+        uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
 
-      - name: Check the SDK and SDL2
+      - name: Install VitaSDK
         run: |
-          export PATH=$VITASDK/bin:$PATH
-          ls $VITASDK/bin | head -40
-          ls $VITASDK/arm-vita-eabi/lib/pkgconfig | grep -i sdl || echo "no SDL2 in the image"
+          set -x
+          git clone --depth 1 https://github.com/vitasdk/vdpm
+          cd vdpm
+          ./bootstrap-vitasdk.sh
+          export PATH="$VITASDK/bin:$PATH"
+          echo "$VITASDK/bin" >> "$GITHUB_PATH"
+          ls "$VITASDK/bin" | head -20
+          # (the only library the game needs beyond the SDK's own; it asks "Proceed? [Y/n]", which nobody can
+          # answer here: so "y" is sent, and pacman's own --noconfirm is the second try)
+          printf 'y\n' | vdpm install sdl2 || vdpm pacman -- -S --noconfirm sdl2
+          ls "$VITASDK/arm-vita-eabi/lib" | grep -i sdl2 || echo "no SDL2 library found"
+
+      - name: Apply the Vita patches (ports/vita), unless already applied
+        run: |
+          for p in CMakeLists.top-level main.c tasks.c; do
+            if patch -p1 -R --dry-run -s < "ports/vita/$p.patch" > /dev/null 2>&1; then
+              echo "$p.patch is already applied"
+            else
+              patch -p1 < "ports/vita/$p.patch"
+            fi
+          done
+
+      - name: Check that the Vita code is in the source (fails if not)
+        run: |
+          echo "main.c: audio_resampler x$(grep -c audio_resampler ports/sdl2/main.c), gxm x$(grep -c gxm ports/sdl2/main.c)"
+          echo "tasks.c: host_switch_stacks x$(grep -c host_switch_stacks runtime/src/tasks.c)"
+          echo "vita.cmake version: $(grep -o 'ORUNNERS_VITA_VERSION "[0-9.]*"' ports/vita/vita.cmake)"
+          grep -q audio_resampler ports/sdl2/main.c
+          grep -q gxm ports/sdl2/main.c
+          grep -q host_switch_stacks runtime/src/tasks.c
 
       - name: Configure
         run: |
-          export PATH=$VITASDK/bin:$PATH
-          cmake -S . -B build/vita -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS=-g \
-            -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
-            -DORUNNERS_VITA=ON -DORUNNERS_REFERENCE_TOOLS=OFF
+          cmake -S . -B build/vita -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DORUNNERS_VITA=ON -DCMAKE_BUILD_TYPE=Release -DORUNNERS_REFERENCE_TOOLS=OFF 2>&1 | tee configure.log
 
-      - name: Build VPK
+      - name: Build
         run: |
-          export PATH=$VITASDK/bin:$PATH
           cmake --build build/vita --target OutRunners.vpk 2>&1 | tee build.log
 
-      - name: Save the VPK
-        uses: actions/upload-artifact@v7
-        with:
-          name: OutRunners-vpk
-          path: build/vita/OutRunners.vpk
-
-      - name: Save the ELF (for crash reports)
-        uses: actions/upload-artifact@v7
-        with:
-          name: OutRunners-elf
-          path: build/vita/OutRunners
-
-      - name: Save the build log
+      - name: Keep the logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: build.log
+          name: vita-build-logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
+
+      - name: Keep the VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OutRunners-vita-vpk
+          path: build/vita/OutRunners.vpk
