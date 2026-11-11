@@ -1,0 +1,69 @@
+--- orig/main.c	2026-11-11 03:39:15.582050145 +0000
++++ new/main.c	2026-11-11 03:39:32.609782391 +0000
+@@ -91,7 +91,11 @@
+ #include <sys/stat.h>
+ #define SWITCH_FOLDER "sdmc:/switch/outrunners"    /* the game's folder on the SD card */
+ #endif
+-#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__)
++#ifdef __vita__
++#include <psp2/io/stat.h>    /* sceIoMkdir: the game's folder on the memory card */
++#define VITA_FOLDER "ux0:data/outrunners"    /* what the game writes, its log and the assets pack */
++#endif
++#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+ #include <unistd.h>        /* fsync: the log on the card as it is written */
+ #endif
+ 
+@@ -126,6 +130,8 @@
+ #define ASSETS_PACK         "outrunners.assets"    /* the assets in one file (game/assets.h), the devices' */
+ #ifdef __SWITCH__
+ #define VIDEO_WORKERS       2          /* the video's rows on cores 1 and 2 (the game's is 0; 3 is the system's) */
++#elif defined(__vita__)
++#define VIDEO_WORKERS       2          /* (a first guess: tune it on a Vita, with the frame time in the log) */
+ #else
+ #define VIDEO_WORKERS       SDL_min(SDL_GetCPUCount() - 1, 3)    /* up to three more cores (a handheld's four) */
+ #endif
+@@ -1770,7 +1776,7 @@
+ static void log_written(void)
+ {
+ 	fflush(stderr);
+-#if !defined(_WIN32) && !defined(__SWITCH__)
++#if !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
+ 	fsync(fileno(stderr));
+ #endif
+ }
+@@ -1942,6 +1948,10 @@
+ #ifdef __SWITCH__
+ 	mkdir(SWITCH_FOLDER, 0777);
+ 	return SDL_strdup(SWITCH_FOLDER "/");
++#elif defined(__vita__)
++	sceIoMkdir("ux0:data", 0777);    /* (it exists on a Vita: this is for a bare card) */
++	sceIoMkdir(VITA_FOLDER, 0777);
++	return SDL_strdup(VITA_FOLDER "/");
+ #elif defined(__ANDROID__)
+ 	return SDL_GetPrefPath("", "OutRunners");    /* (the app's own folder, its internal storage) */
+ #elif defined(_WIN32) || defined(ORUNNERS_HANDHELD)
+@@ -2066,6 +2076,15 @@
+ 	freopen(SWITCH_FOLDER "/outrunners.log", "w", stderr);
+ 	fprintf(stderr, "OutRunners: starting\n");
+ #endif
++#ifdef __vita__
++	/* (what the game says goes to outrunners.log in its folder: a Vita has no console, and a crash leaves
++	   nothing else to read) */
++	sceIoMkdir("ux0:data", 0777);
++	sceIoMkdir(VITA_FOLDER, 0777);
++	freopen(VITA_FOLDER "/outrunners.log", "w", stderr);
++	setvbuf(stderr, NULL, _IOLBF, 0);    /* (a line at a time: the last one before a crash is the one that counts) */
++	fprintf(stderr, "OutRunners: starting\n");
++#endif
+ #ifdef __ANDROID__
+ 	/* (what the game says goes to outrunners.log in the app's folder on the storage, Android/data/<the
+ 	   app>/files: stderr goes nowhere there) */
+@@ -2135,6 +2154,8 @@
+ 
+ #ifdef __SWITCH__
+ 	base = SDL_strdup("romfs:/");    /* (what comes with the game: the pack and the pictures) */
++#elif defined(__vita__)
++	base = SDL_strdup("app0:/");     /* (the VPK's files: the pictures; the pack is looked for in the game's folder too) */
+ #elif defined(__ANDROID__)
+ 	base = SDL_strdup("");           /* (the APK's assets, which SDL's files read by a relative path) */
+ #else
