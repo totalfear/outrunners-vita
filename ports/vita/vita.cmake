@@ -41,6 +41,8 @@ target_link_libraries(OutRunners PRIVATE orunners_game_console orunners_sound
 	SceNet_stub SceNetCtl_stub ScePower_stub
 	m pthread)    # (VitaSDK's toolchain is not UNIX to CMake: the runtime's own m and Threads are not linked)
 target_link_options(OutRunners PRIVATE -Wl,-q)
+   # (the video's workers, in s32runtime, need the threads: libraries are read in order, so they go after it)
+   target_link_libraries(s32runtime PUBLIC m pthread)
 
 vita_create_self(OutRunners.self OutRunners)
 vita_create_vpk(OutRunners.vpk ${ORUNNERS_VITA_TITLEID} OutRunners.self
