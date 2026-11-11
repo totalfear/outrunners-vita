@@ -21,7 +21,7 @@
 
 /* the C of a task nests as deep as the game's calls do, with the locals of the generated code */
 #ifdef __vita__
-#define TASK_STACK_SIZE (2u << 20)    /* (a Vita gives an app about 256 MB: 16 MB a task is too much; raise this if the log shows a crash in a task) */
+#define TASK_STACK_SIZE (16u << 20)    /* (a test, as on the other devices: if the log shows few tasks, 16 MB is all right; was 2 MB) */
 #else
 #define TASK_STACK_SIZE (16u << 20)
 #endif
@@ -228,6 +228,8 @@ host_task *host_task_main(void)
 
 static void run_task(void)
 {
+	fprintf(stderr, "trace: a task has started\n");    /* (a test: remove when the Vita runs) */
+	fflush(stderr);
 	current->start();
 	fprintf(stderr, "A task came to its end\n");
 	exit(3);
@@ -263,6 +265,15 @@ void host_task_switch(host_task *to)
 	if (to == from)
 		return;
 	current = to;
+	{
+		static unsigned switches;    /* (a test: the first switches in the log, remove when the Vita runs) */
+
+		if (switches < 12)
+		{
+			fprintf(stderr, "trace: switch %u\n", ++switches);
+			fflush(stderr);
+		}
+	}
 	host_switch_stacks(&from->stack_pointer, to->stack_pointer);
 }
 
