@@ -113,7 +113,7 @@ jobs:
           def edit(name, marker, old, new):
               EDITS.append((name, marker, old, new))
 
-          edit("folder and includes", 'VITA_FOLDER "ux0:data/OutRunners"',
+          edit("folder and includes", re.compile(r"#\s*define\s+VITA_FOLDER\b"),
           '''#if defined(ORUNNERS_HANDHELD) && !defined(_WIN32) && !defined(__SWITCH__)
           #include <unistd.h>        /* fsync: the log on the card as it is written */
           #endif
@@ -140,7 +140,7 @@ jobs:
           #if !defined(_WIN32) && !defined(__SWITCH__) && !defined(__vita__)
           	fsync(fileno(stderr));''')
 
-          edit("saves folder", 'mkdir(VITA_FOLDER, 0777); return SDL_strdup(VITA_FOLDER "/");',
+          edit("saves folder", re.compile(r"return\s+SDL_strdup\(\s*VITA_FOLDER", re.I),
           '''	return SDL_strdup(SWITCH_FOLDER "/");
           #elif defined(__ANDROID__)''','''	return SDL_strdup(SWITCH_FOLDER "/");
           #elif defined(__vita__)
@@ -148,7 +148,7 @@ jobs:
           	return SDL_strdup(VITA_FOLDER "/");
           #elif defined(__ANDROID__)''')
 
-          edit("log file", 'freopen(VITA_FOLDER "/outrunners.log", "w", stderr);',
+          edit("log file", re.compile(r"freopen\(\s*VITA_FOLDER", re.I),
           '''#ifdef __ANDROID__
           	/* (what the game says goes to outrunners.log in the app's folder''','''#ifdef __vita__
           	/* (what the game says, failures included, goes to outrunners.log in its folder on the card: the Vita has no
@@ -160,7 +160,7 @@ jobs:
           #ifdef __ANDROID__
           	/* (what the game says goes to outrunners.log in the app's folder''')
 
-          edit("window", 'window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);',
+          edit("window", re.compile(r"defined\(\s*__vita__\s*\)[^#]{0,300}?SDL_CreateWindow", re.S),
           '''#elif defined(ORUNNERS_HANDHELD)
           	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''','''#elif defined(__vita__)
           	/* (the Vita's screen, 960 x 544: the system shows the window as all of it) */
@@ -257,8 +257,13 @@ jobs:
 
           problems = []
           done = []
+          def is_in(marker):
+              if hasattr(marker, "search"):
+                  return marker.search(s) is not None
+              return norm(marker) in norm(s)
+
           for name, marker, old, new in EDITS:
-              if norm(marker) in norm(s):
+              if is_in(marker):
                   done.append(name + ": already in")
                   continue
               pat = pattern(old)
@@ -281,6 +286,10 @@ jobs:
                       print("%5d: %s" % (i, line))
               sys.exit(1)
 
+          print("the Vita lines of main.c now:")
+          for i, line in enumerate(s.split("\n"), 1):
+              if "__vita__" in line or "VITA_FOLDER" in line or "audio_resampler" in line:
+                  print("%5d: %s" % (i, line.strip()[:110]))
           s = s.replace("\n", nl)
           if s != orig:
               open(path, "w", encoding="utf-8", newline="").write(s)
