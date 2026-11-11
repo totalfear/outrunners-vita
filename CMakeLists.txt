@@ -193,7 +193,7 @@ if(ORUNNERS_DECOMPILED AND ORUNNERS_SOUND_DECOMPILED)
 	# main.npdm, control.nacp, icon.jpg), the assets pack of the player's ROM set (the first run's steps, the
 	# console game's loader) and the keys of the player's console. A command line; with SDL2 also a window
 	# (below, with the game's window)
-	if(NOT ORUNNERS_SWITCH AND NOT ORUNNERS_ANBERNIC AND NOT ANDROID)
+	if(NOT ORUNNERS_SWITCH AND NOT ORUNNERS_ANBERNIC AND NOT ORUNNERS_VITA AND NOT ANDROID)
 		add_executable(orunners_nsp ports/switch/nsp/main.c ports/switch/nsp/make_nsp.c ports/switch/nsp/formats.c
 			ports/switch/nsp/crypto.c ports/switch/nsp/rom_pack.c)
 		target_link_libraries(orunners_nsp PRIVATE orunners_game_console orunners_sound orunners_extract)
@@ -227,10 +227,13 @@ if(ORUNNERS_DECOMPILED AND ORUNNERS_SOUND_DECOMPILED)
 	# pieces, ports/switch), Android (the NDK's: libmain.so in its APKs, ports/android) and Anbernic's H700
 	# handhelds (ports/anbernic)
 	option(ORUNNERS_ANBERNIC "Build the game for Anbernic's H700 handhelds" OFF)
+option(ORUNNERS_VITA "Build the game for the PlayStation Vita (vitasdk's toolchain file)" OFF)
 	if(ORUNNERS_SWITCH)
 		include(${CMAKE_SOURCE_DIR}/ports/switch/switch.cmake)
 	elseif(ANDROID)
 		include(${CMAKE_SOURCE_DIR}/ports/android/android.cmake)
+	elseif(ORUNNERS_VITA)
+		include(${CMAKE_SOURCE_DIR}/ports/vita/vita.cmake)
 	elseif(ORUNNERS_ANBERNIC)
 		include(${CMAKE_SOURCE_DIR}/ports/anbernic/anbernic.cmake)
 	endif()
@@ -238,7 +241,7 @@ if(ORUNNERS_DECOMPILED AND ORUNNERS_SOUND_DECOMPILED)
 	# The game in a window (ports/sdl2): SDL2 from the system, or on Windows the development package
 	# unpacked in build/downloads/sdl2 (SDL2_DIR picks another), a library beside the executable; or, with
 	# ORUNNERS_STATIC_SDL2, SDL2 built from its own source into the executable
-	if(ORUNNERS_ANBERNIC OR ORUNNERS_SWITCH OR ANDROID)
+	if(ORUNNERS_ANBERNIC OR ORUNNERS_VITA OR ORUNNERS_SWITCH OR ANDROID)
 		set(SDL2_FOUND FALSE)    # (the device's own build above: no computer's window ports)
 	elseif(ORUNNERS_STATIC_SDL2)
 		include(FetchContent)
