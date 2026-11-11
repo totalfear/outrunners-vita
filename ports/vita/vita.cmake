@@ -1,51 +1,31 @@
 # Name:        vita.cmake
-# Description: the console game (OutRunners) for the PlayStation Vita, built with VitaSDK
-# Status:      FIRST DRAFT: not built and not run on a Vita yet. Modelled on ports/anbernic/anbernic.cmake.
+# Description: the build for the PlayStation Vita (vitasdk): the console game alone, as OutRunners.vpk
 #
-#   export VITASDK=/usr/local/vitasdk && export PATH=$VITASDK/bin:$PATH
-#   cmake -S . -B build/vita -G Ninja -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
-#         -DORUNNERS_VITA=ON -DCMAKE_BUILD_TYPE=Release -DORUNNERS_REFERENCE_TOOLS=OFF
-#   cmake --build build/vita --target OutRunners.vpk
-#
-# The VPK holds the game and CONTROLS' button pictures, nothing from the ROM. The assets pack of the player's
-# own ROM set (outrunners.assets, made on a computer by OutRunners Anbernic) goes to ux0:data/OutRunners/
-# (ports/vita/README.md): never share it.
+# Included by CMakeLists.txt with ORUNNERS_VITA (and vitasdk's toolchain file: -DCMAKE_TOOLCHAIN_FILE=
+# $VITASDK/share/vita.toolchain.cmake). As the Anbernic build: the console game with its picture fixed
+# (ORUNNERS_HANDHELD), the system's SDL2 (vitasdk's), and no assets in the package: outrunners.assets is made
+# on a computer by OutRunners Anbernic from the player's ROM set and put in ux0:data/outrunners/
 
-if(NOT DEFINED ENV{VITASDK})
-	message(FATAL_ERROR "VITASDK is not set: install VitaSDK (https://vitasdk.org) and export VITASDK")
-endif()
-include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+target_compile_definitions(orunners_game_console PUBLIC ORUNNERS_HANDHELD ORUNNERS_CONTROLS_PAGE ORUNNERS_VITA)
 
-set(ORUNNERS_VITA_TITLEID "ORUN00001" CACHE STRING "The Vita's title id: 4 capital letters and 5 digits")
-set(ORUNNERS_VITA_VERSION "01.00" CACHE STRING "The version the Vita shows: XX.YY")
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
 
-# (as the Anbernic build: no first run, so no letters.c)
 add_executable(OutRunners ports/sdl2/main.c ports/sdl2/forces.c ports/sdl2/controls.c ports/vita/vita_runtime.c)
+target_include_directories(OutRunners PRIVATE ${SDL2_INCLUDE_DIRS})
+target_link_libraries(OutRunners PRIVATE orunners_game_console orunners_sound ${SDL2_LIBRARIES} ScePower_stub pthread m)
 
-# The handheld's way, as anbernic.cmake has it (the picture fixed, the log, no first run, CONTROLS in OPTIONS),
-# on the console library, which console/*.c is built in, and WIDE 16:9 as the Switch's: the Vita's screen is
-# 960 x 544. Left out: the Anbernic's own ORUNNERS_HANDHELD_KEYS (MENU and the volume keys) and
-# ORUNNERS_ANBERNIC_BUTTONS (its button defaults): the Vita gets SDL's game controller defaults (Cross the gas,
-# Circle the brake, the shoulders shift), which OPTIONS > CONTROLS changes
-target_compile_definitions(orunners_game_console PUBLIC ORUNNERS_HANDHELD ORUNNERS_CONTROLS_PAGE ORUNNERS_SCREEN_WIDE)
-target_compile_definitions(OutRunners PRIVATE ORUNNERS_VITA)
-
-# VitaSDK's SDL2 is a static library in its own sysroot
-target_include_directories(OutRunners PRIVATE $ENV{VITASDK}/arm-vita-eabi/include/SDL2)
-
-target_link_libraries(OutRunners PRIVATE orunners_game_console orunners_sound
-	SDL2
-	# what SDL2's Vita backend and the game's own code (arcade_lan's sockets, the clocks) call
-	SceDisplay_stub SceCtrl_stub SceAudio_stub SceAudioIn_stub SceSysmodule_stub SceGxm_stub
-	SceCommonDialog_stub SceAppMgr_stub SceTouch_stub SceHid_stub SceMotion_stub
-	SceNet_stub SceNetCtl_stub ScePower_stub
-	m pthread)    # (VitaSDK's toolchain is not UNIX to CMake: the runtime's own m and Threads are not linked)
-target_link_options(OutRunners PRIVATE -Wl,-q)
-   # (the video's workers, in s32runtime, need the threads: libraries are read in order, so they go after it)
-   target_link_libraries(s32runtime PUBLIC m pthread)
+# vita_create_self looks for the ELF in this folder. CMakeLists.txt sends every executable to build/bin through
+# the plain and the per-configuration variables (Release is the default), and a per-configuration property
+# beats the plain one: all of them are set here
+set(ORUNNERS_VITA_OUT ${CMAKE_CURRENT_BINARY_DIR})
+set_target_properties(OutRunners PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ORUNNERS_VITA_OUT})
+foreach(config IN ITEMS _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+	set_target_properties(OutRunners PROPERTIES RUNTIME_OUTPUT_DIRECTORY${config} ${ORUNNERS_VITA_OUT})
+endforeach()
 
 vita_create_self(OutRunners.self OutRunners)
-vita_create_vpk(OutRunners.vpk ${ORUNNERS_VITA_TITLEID} OutRunners.self
-	VERSION ${ORUNNERS_VITA_VERSION}
-	NAME "OutRunners"
+vita_create_vpk(OutRunners.vpk ORUN00001 OutRunners.self
+	VERSION 01.00 NAME "OutRunners"
+	FILE ${CMAKE_SOURCE_DIR}/ports/vita/sce_sys sce_sys
 	FILE ${CMAKE_SOURCE_DIR}/ports/sdl2/prompts/input_prompts.bmp input_prompts.bmp)
