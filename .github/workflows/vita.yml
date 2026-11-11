@@ -4,27 +4,28 @@ on:
   push:
   workflow_dispatch:
 
-env:
-  VITASDK: /home/runner/vitasdk
-  PKG_CONFIG_PATH: /home/runner/vitasdk/arm-vita-eabi/lib/pkgconfig
-
 jobs:
   build:
     runs-on: ubuntu-24.04
+    container: vitasdk/vitasdk:latest
+    env:
+      VITASDK: /usr/local/vitasdk
+      PKG_CONFIG_PATH: /usr/local/vitasdk/arm-vita-eabi/lib/pkgconfig
     steps:
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y ninja-build pkg-config python3 git
+
       - uses: actions/checkout@v7
         with:
           submodules: true
 
-      - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake pkg-config python3
-
-      - name: Install VitaSDK and SDL2
+      - name: Check the SDK and SDL2
         run: |
-          git clone https://github.com/vitasdk/vdpm
-          cd vdpm
-          ./bootstrap-vitasdk.sh
-          ./vdpm sdl2
+          export PATH=$VITASDK/bin:$PATH
+          ls $VITASDK/bin | head -40
+          ls $VITASDK/arm-vita-eabi/lib/pkgconfig | grep -i sdl || echo "no SDL2 in the image"
 
       - name: Configure
         run: |
