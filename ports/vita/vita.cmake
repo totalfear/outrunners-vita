@@ -6,6 +6,12 @@
 # (ORUNNERS_HANDHELD), the system's SDL2 (vitasdk's), and no assets in the package: outrunners.assets is made
 # on a computer by OutRunners Anbernic from the player's ROM set and put in ux0:data/outrunners/
 
+# vitasdk's macros (vita_create_self, vita_create_vpk): the toolchain file does not load them
+if(NOT DEFINED ENV{VITASDK})
+	message(FATAL_ERROR "VITASDK is not set: the Vita build needs vitasdk")
+endif()
+include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+
 target_compile_definitions(orunners_game_console PUBLIC ORUNNERS_HANDHELD ORUNNERS_CONTROLS_PAGE ORUNNERS_VITA)
 
 find_package(PkgConfig REQUIRED)
