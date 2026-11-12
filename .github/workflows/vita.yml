@@ -716,9 +716,12 @@ jobs:
 
           host_task *host_task_create(void (*start)(void))
           {
-          	static const size_t sizes[] = { TASK_STACK_SIZE, 1u << 20, 256u << 10 };    /* (the first that the system gives) */
+          	static const size_t sizes[] = { TASK_STACK_SIZE, TASK_STACK_SIZE / 2, TASK_STACK_SIZE / 4 };
+          	static unsigned tasks_made;
+          	static size_t stacks_taken;
           	host_task *task = calloc(1, sizeof(*task));
           	pthread_t thread;
+          	size_t granted = 0;
           	int made = 0;
 
           	tasks_start_up();
@@ -734,13 +737,23 @@ jobs:
           			pthread_attr_setstacksize(&attributes, sizes[size]);
           			made = pthread_create(&thread, &attributes, run_task, task) == 0;
           			pthread_attr_destroy(&attributes);
+          			if (made)
+          				granted = sizes[size];
           		}
           	}
           	if (!task || !made)
           	{
-          		fprintf(stderr, "A task could not be created\n");
+          		fprintf(stderr, "A task could not be created (%u made, %u KB of stacks taken)\n",
+          			tasks_made, (unsigned)(stacks_taken >> 10));
           		exit(3);
           	}
+          	tasks_made++;
+          	stacks_taken += granted;
+          	/* A task given less than it asked for is the one that will fall over, and a stack it runs off the end
+          	   of kills the program where it stands, with nothing in the log. Say so where it happens instead */
+          	fprintf(stderr, "task %u: %u KB of stack%s (%u KB taken by stacks in all)\n", tasks_made,
+          		(unsigned)(granted >> 10), granted < sizes[0] ? "  *** LESS THAN IT ASKED FOR ***" : "",
+          		(unsigned)(stacks_taken >> 10));
           	pthread_detach(thread);
           	return task;
           }
@@ -787,18 +800,30 @@ jobs:
           	}
           """
 
-          # 1. the Vita's stack size for a task: its memory is 256 MB in all, not 16 MB for each task
-          if re.search(r"#\s*(ifdef\s+__vita__|if\s+defined\(\s*__vita__\s*\))\s*\n\s*#\s*define\s+TASK_STACK_SIZE", s):
+          # 1. the Vita's stack size for a task. Every task is a thread of its own here and pthreads takes its
+          #    stack out of the 128 MB newlib heap, so 16 MB apiece runs out after a handful; the chain below then
+          #    hands a late task whatever is left, and a task made late (a game over restarting the race) falls
+          #    over on it with no message at all. A smaller, uniform size lets them all have one
+          VITA_STACK = ("#ifdef __vita__\n"
+              "#define TASK_STACK_SIZE (2u << 20)     /* (a thread each, out of a 128 MB heap: 16 MB apiece runs out) */\n"
+              "#else\n"
+              "#define TASK_STACK_SIZE (16u << 20)\n"
+              "#endif\n")
+          if "(2u << 20)" in s:
               done.append("stack size: already in")
           else:
-              s, n = re.subn(r"(?m)^#define TASK_STACK_SIZE \(16u << 20\)[ \t]*\n",
-                  "#ifdef __vita__\n#define TASK_STACK_SIZE (4u << 20)     /* (the Vita's memory is 256 MB in all: less than the others' 16 MB each) */\n#else\n#define TASK_STACK_SIZE (16u << 20)\n#endif\n", s, count=1)
+              s, n = re.subn(r"(?m)^#ifdef __vita__\n#define TASK_STACK_SIZE [^\n]*\n#else\n#define TASK_STACK_SIZE \(16u << 20\)[ \t]*\n#endif\n",
+                  VITA_STACK, s, count=1)
               if n == 1:
-                  done.append("stack size: added")
-              elif re.search(r"(?m)^#\s*define\s+TASK_STACK_SIZE\b", s):
-                  done.append("stack size: left as it is (not the original 16 MB)")
+                  done.append("stack size: the Vita's block set to 2 MB")
               else:
-                  problems.append("stack size: no '#define TASK_STACK_SIZE' line found")
+                  s, n = re.subn(r"(?m)^#define TASK_STACK_SIZE \(16u << 20\)[ \t]*\n", VITA_STACK, s, count=1)
+                  if n == 1:
+                      done.append("stack size: added")
+                  elif re.search(r"(?m)^#\s*define\s+TASK_STACK_SIZE\b", s):
+                      done.append("stack size: left as it is (not the original 16 MB)")
+                  else:
+                      problems.append("stack size: no '#define TASK_STACK_SIZE' line found")
 
           # 2. the Vita's task switch: a thread for each task (its kernel stops a program that makes a system call from a
           #    stack it did not give: the earlier version of this edit, a stack made by hand, did that)
