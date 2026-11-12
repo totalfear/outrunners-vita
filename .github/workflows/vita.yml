@@ -846,6 +846,11 @@ jobs:
           grep -q VITA_PIN_LIBS ports/vita/vita.cmake
           test -f ports/vita/vita_pin.c
 
+      - name: Show the compiler's CPU defaults
+        run: |
+          # (which CPU, FPU and float ABI the SDK's compiler builds for when no flag says: in the logs artifact as cpu.log)
+          { arm-vita-eabi-gcc -Q --help=target | grep -E '^ +-(mcpu|mtune|march|mfpu|mfloat-abi)=' ; arm-vita-eabi-gcc -dM -E - </dev/null | grep -E '__ARM_NEON|__ARM_ARCH |__ARM_PCS_VFP|__ARM_FP ' ; } 2>&1 | tee cpu.log || true
+
       - name: Configure
         run: |
           cmake -S . -B build/vita -G Ninja \
@@ -864,6 +869,7 @@ jobs:
           path: |
             configure.log
             build.log
+            cpu.log
           if-no-files-found: ignore
 
       - name: Make the symbol list (names the addresses of a crash dump)
