@@ -257,25 +257,67 @@ jobs:
           #elif defined(ORUNNERS_HANDHELD)
           	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''')
 
-          edit("audio helper", 'static void queue_audio(const void *data, Uint32 bytes)',
+          edit("audio helper", 'queue_resampled',
           '''static SDL_AudioDeviceID audio;
           ''','''static SDL_AudioDeviceID audio;
           #ifdef __vita__
-          static SDL_AudioStream *audio_resampler;    /* the mix's rate to the 48000 Hz the Vita's audio takes, when it does not take it */
+          static SDL_AudioStream *audio_resampler;    /* the mark that the mix's rate is not the one the device took (audio open, below) */
+
+          /* The mix's rate (the chips' 55555 Hz) to the 48000 the Vita's audio takes. SDL's own stream costs about
+             2 ms of every frame on this machine, more than the sound chips themselves cost to run, and the log said
+             so ("queueing it"); this walks the mix with a 16.16 step and interpolates between the two samples it
+             falls between, which a board's mix does not suffer from. The step is kept between frames, with the
+             frame's last sample, so the two meet without a click */
+          #define RESAMPLE_RATE 48000
+
+          static uint32_t resample_phase;      /* where the next sample out falls in the mix, 16.16 */
+          static int16_t resample_last[2];     /* the last sample of the frame before */
+          static bool resample_going;          /* resample_last holds one */
+
+          static void queue_resampled(const int16_t *samples, size_t frames)
+          {
+          	static int16_t out[4096];        /* (a frame of the mix is about 926 samples, which make about 800) */
+          	const size_t room = sizeof(out) / sizeof(out[0]) / 2;
+          	const uint32_t step = (uint32_t)(((uint64_t)sound_chips_mix_rate() << 16) / RESAMPLE_RATE);
+          	uint32_t phase = resample_phase;
+          	size_t made = 0;
+
+          	if (frames == 0)
+          		return;
+          	if (!resample_going)
+          	{
+          		resample_last[0] = samples[0];
+          		resample_last[1] = samples[1];
+          		resample_going = true;
+          	}
+          	while ((size_t)(phase >> 16) < frames && made < room)
+          	{
+          		const size_t index = phase >> 16;
+          		const int32_t between = (int32_t)(phase & 0xffff);
+          		const int16_t *before = index == 0 ? resample_last : &samples[(index - 1) * 2];
+          		const int16_t *after = &samples[index * 2];
+
+          		out[made * 2] = (int16_t)(before[0] + (((int32_t)after[0] - before[0]) * between >> 16));
+          		out[made * 2 + 1] = (int16_t)(before[1] + (((int32_t)after[1] - before[1]) * between >> 16));
+          		made++;
+          		phase += step;
+          	}
+          	/* what is left of the step goes on into the next frame (nothing, if the buffer above ran out first) */
+          	resample_phase = (size_t)(phase >> 16) >= frames ? phase - (uint32_t)(frames << 16) : 0;
+          	resample_last[0] = samples[(frames - 1) * 2];
+          	resample_last[1] = samples[(frames - 1) * 2 + 1];
+          	if (made > 0)
+          		SDL_QueueAudio(audio, out, (Uint32)(made * 2 * sizeof(int16_t)));
+          }
           #endif
 
-          /* The mix to the device's queue (through the resampler on the Vita, when there is one) */
+          /* The mix to the device's queue (resampled on the Vita, where the device would not take the mix's rate) */
           static void queue_audio(const void *data, Uint32 bytes)
           {
           #ifdef __vita__
           	if (audio_resampler)
           	{
-          		Uint8 converted[8192];
-          		int got;
-
-          		if (SDL_AudioStreamPut(audio_resampler, data, (int)bytes) == 0)
-          			while ((got = SDL_AudioStreamGet(audio_resampler, converted, sizeof(converted))) > 0)
-          				SDL_QueueAudio(audio, converted, (Uint32)got);
+          		queue_resampled((const int16_t *)data, bytes / (2 * sizeof(int16_t)));
           		return;
           	}
           #endif
@@ -501,6 +543,14 @@ jobs:
           				(double)s32_video_pace_layers / 1000.0 / pace_frames,
           				(double)s32_video_pace_mix / 1000.0 / pace_frames);
           			s32_video_pace_layers = s32_video_pace_mix = 0;
+          		}
+          		{
+          			/* (runtime/src/machine.c: how often the game reached the board, a frame) */
+          			extern uint64_t s32_io_reads, s32_io_writes;
+
+          			fprintf(stderr, "  board reads %.0f a frame, writes %.0f\\n",
+          				(double)s32_io_reads / pace_frames, (double)s32_io_writes / pace_frames);
+          			s32_io_reads = s32_io_writes = 0;
           		}
           		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
           			(double)pace_sprites * per_frame,
@@ -1027,6 +1077,51 @@ jobs:
           else:
               print("runtime/src/video.c: the Vita edits were already in")
           VIDEO_EDITS
+          python3 - <<'MACHINE_EDITS'
+          import io, re, sys
+
+          path = "runtime/src/machine.c"
+          s = io.open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+
+          # The decompiled game reaches the board through these six, and every one decodes the address before it
+          # knows where it goes. "the game's own code" in the Vita's log is 15.8 ms a frame and nothing says how
+          # much of it is these: counting them is a cycle each and tells whether the dispatch is worth attacking
+          READS = ["uint8_t s32_read8(uint32_t address)", "uint16_t s32_read16(uint32_t address)",
+                   "uint32_t s32_read32(uint32_t address)"]
+          WRITES = ["void s32_write8(uint32_t address, uint8_t data)", "void s32_write16(uint32_t address, uint16_t data)",
+                    "void s32_write32(uint32_t address, uint32_t data)"]
+
+          if "s32_io_reads" in s:
+              print("  board i/o counters: already in")
+          else:
+              problems = []
+              for signature in READS + WRITES:
+                  if s.count(signature + "\n{\n") != 1:
+                      problems.append("%s was found %d times (wanted 1)" % (signature, s.count(signature + "\n{\n")))
+              if problems:
+                  print("machine.c does not look as expected:")
+                  for p in problems:
+                      print("  -", p)
+                  sys.exit(1)
+              s = s.replace(READS[0] + "\n{\n",
+                            "/* (the Vita's log: how often the game reaches the board, and which way) */\n"
+                            "uint64_t s32_io_reads, s32_io_writes;\n\n" + READS[0] + "\n{\n\ts32_io_reads++;\n", 1)
+              for signature in READS[1:]:
+                  s = s.replace(signature + "\n{\n", signature + "\n{\n\ts32_io_reads++;\n", 1)
+              for signature in WRITES:
+                  s = s.replace(signature + "\n{\n", signature + "\n{\n\ts32_io_writes++;\n", 1)
+              print("  board i/o counters: added")
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              io.open(path, "w", encoding="utf-8", newline="").write(s)
+              print("runtime/src/machine.c: the Vita edits are in")
+          else:
+              print("runtime/src/machine.c: the Vita edits were already in")
+          MACHINE_EDITS
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
