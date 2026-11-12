@@ -415,6 +415,89 @@ jobs:
           #endif
           """)
 
+          # --- the Vita's timing (Vita only): where a frame's time goes, a second line in the log after the pace line ---
+          edit("timing variables", 'pace_sound',
+          """static uint64_t pace_video, pace_showing;""",
+          """#ifdef __vita__
+          static uint64_t pace_controls, pace_sound, pace_queue, pace_extras;    /* the Vita's log: the controls, the sound, queueing it, the frame's end in all */
+          #endif
+          static uint64_t pace_video, pace_showing;""")
+
+          edit("timing controls", 'on_controls_update_work',
+          """static void on_controls_update(void)""",
+          """#ifdef __vita__
+          static void on_controls_update_work(void);
+
+          static void on_controls_update(void)
+          {
+          	const uint64_t controls_start = SDL_GetPerformanceCounter();
+
+          	on_controls_update_work();
+          	pace_controls += SDL_GetPerformanceCounter() - controls_start;
+          }
+
+          static void on_controls_update_work(void)
+          #else
+          static void on_controls_update(void)
+          #endif""")
+
+          edit("timing frame's end start", 'done_start',
+          """log_pace(true);""",
+          """	log_pace(true);
+          #ifdef __vita__
+          	const uint64_t done_start = SDL_GetPerformanceCounter();
+          #endif""")
+
+          edit("timing sound", 'sound_start',
+          """if (s32_board.time_passes)
+          		s32_board.time_passes(s32_board.cycles);
+          	sound_chips_end_frame(s32_board.cycles);""",
+          """#ifdef __vita__
+          	const uint64_t sound_start = SDL_GetPerformanceCounter();
+          #endif
+          	if (s32_board.time_passes)
+          		s32_board.time_passes(s32_board.cycles);
+          	sound_chips_end_frame(s32_board.cycles);
+          #ifdef __vita__
+          	pace_sound += SDL_GetPerformanceCounter() - sound_start;
+          #endif""")
+
+          edit("timing queue", 'queue_start',
+          """queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));""",
+          """#ifdef __vita__
+          	{
+          		const uint64_t queue_start = SDL_GetPerformanceCounter();
+
+          		queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));
+          		pace_queue += SDL_GetPerformanceCounter() - queue_start;
+          	}
+          #else
+          		queue_audio(mix, (Uint32)(count * 2 * sizeof(int16_t)));
+          #endif""")
+
+          edit("timing frame's end", 'pace_extras +=',
+          """if (!fast)
+          		wait_for_frame();""",
+          """#ifdef __vita__
+          	pace_extras += SDL_GetPerformanceCounter() - done_start;
+          #endif
+          	if (!fast)
+          		wait_for_frame();""")
+
+          edit("timing log", 'waiting %.1f',
+          """pace_start = now;
+          		pace_frames = 0;""",
+          """#ifdef __vita__
+          		fprintf(stderr, "  controls %.1f ms, sound %.1f, queueing it %.1f, the frame's end in all %.1f, waiting %.1f\\n",
+          			(double)pace_controls * per_frame, (double)pace_sound * per_frame, (double)pace_queue * per_frame,
+          			(double)pace_extras * per_frame,
+          			((double)(now - pace_start) - (double)pace_work - (double)pace_extras) * per_frame);
+          		pace_controls = pace_sound = pace_queue = pace_extras = 0;
+          #endif
+          		pace_start = now;
+          		pace_frames = 0;""")
+
+
           problems = []
           done = []
           def is_in(marker):
