@@ -310,83 +310,82 @@ jobs:
 
           VITA_BRANCH = r"""#elif defined(__vita__)
 
-          /* The Vita's C library has no ucontext either: as on the aarch64 above, a task's registers are kept on its own
-             stack. What a call keeps for its caller (AAPCS: r4-r11, the return address lr, d8-d15) is pushed where the
-             task stops and popped where it goes on; the stack pointer is all the task keeps beside it. The routine is
-             assembled as ARM code whichever the file is (and the mode put back after it), with no instruction that
-             Thumb-2 would take for another (SP stored with a plain str) */
-          #define SAVED_WORDS 25    /* d8-d15 (16 words, lowest), r4-r11 (8), lr (the highest) */
-
-          void host_switch_stacks(void **from_stack, void *to_stack);
-
-          __asm__(
-          	".text\n"
-          	".arm\n"
-          	".align 2\n"
-          	".global host_switch_stacks\n"
-          	".type host_switch_stacks, %function\n"
-          	"host_switch_stacks:\n"
-          	"	push {r4-r11, lr}\n"
-          	"	vpush {d8-d15}\n"
-          	"	mov r2, sp\n"
-          	"	str r2, [r0]\n"
-          	"	mov sp, r1\n"
-          	"	vpop {d8-d15}\n"
-          	"	pop {r4-r11, lr}\n"
-          	"	bx lr\n"
-          	".size host_switch_stacks, .-host_switch_stacks\n"
-          #ifdef __thumb__
-          	".thumb\n"
-          #else
-          	".arm\n"
-          #endif
-          );
+          /* The Vita's kernel does not let a program run on a stack it did not get from the kernel: a system call made from
+             one stops the program as a stack overflow (what a task with its stack made by hand did on the real machine). So a
+             task is a thread of its own, with a stack of its own made by pthreads, and only one of the threads runs at a time:
+             a switch hands the turn to the task that is wanted, and the task that asks waits for its own.  VITA_TASK_THREADS */
+          #include <pthread.h>
 
           struct host_task
           {
-          	void *stack_pointer;    /* where it stopped: its registers on top */
-          	void *stack;
+          	pthread_cond_t wake;
+          	int go;                    /* it is this task's turn to run */
           	void (*start)(void);
           };
 
+          static pthread_mutex_t turn;    /* one lock for all the hand-overs */
           static host_task main_task;
           static host_task *current;
 
-          host_task *host_task_main(void)
+          static void tasks_start_up(void)
           {
           	if (!current)
+          	{
+          		pthread_mutex_init(&turn, NULL);
+          		pthread_cond_init(&main_task.wake, NULL);
           		current = &main_task;
+          	}
+          }
+
+          host_task *host_task_main(void)
+          {
+          	tasks_start_up();
           	return &main_task;
           }
 
-          static void run_task(void)
+          static void *run_task(void *argument)
           {
-          	current->start();
+          	host_task *task = argument;
+
+          	pthread_mutex_lock(&turn);
+          	while (!task->go)
+          		pthread_cond_wait(&task->wake, &turn);
+          	task->go = 0;
+          	pthread_mutex_unlock(&turn);
+          	task->start();
           	fprintf(stderr, "A task came to its end\n");
           	exit(3);
+          	return NULL;
           }
 
           host_task *host_task_create(void (*start)(void))
           {
+          	static const size_t sizes[] = { TASK_STACK_SIZE, 1u << 20, 256u << 10 };    /* (the first that the system gives) */
           	host_task *task = calloc(1, sizeof(*task));
-          	uintptr_t top;
-          	uint32_t *registers;
+          	pthread_t thread;
+          	int made = 0;
 
+          	tasks_start_up();
           	if (task)
-          		task->stack = malloc(TASK_STACK_SIZE);
-          	if (!task || !task->stack)
+          	{
+          		task->start = start;
+          		pthread_cond_init(&task->wake, NULL);
+          		for (size_t size = 0; size < sizeof(sizes) / sizeof(sizes[0]) && !made; size++)
+          		{
+          			pthread_attr_t attributes;
+
+          			pthread_attr_init(&attributes);
+          			pthread_attr_setstacksize(&attributes, sizes[size]);
+          			made = pthread_create(&thread, &attributes, run_task, task) == 0;
+          			pthread_attr_destroy(&attributes);
+          		}
+          	}
+          	if (!task || !made)
           	{
           		fprintf(stderr, "A task could not be created\n");
           		exit(3);
           	}
-          	task->start = start;
-          	/* its first switch pops registers that return into run_task, and leaves the stack pointer at the top of
-          	   its stack, 8-byte aligned as a call wants it */
-          	top = ((uintptr_t)task->stack + TASK_STACK_SIZE) & ~(uintptr_t)7;
-          	registers = (uint32_t *)(top - SAVED_WORDS * sizeof(uint32_t));
-          	memset(registers, 0, SAVED_WORDS * sizeof(uint32_t));
-          	registers[SAVED_WORDS - 1] = (uint32_t)(uintptr_t)run_task;    /* (lr: where the first bx goes) */
-          	task->stack_pointer = registers;
+          	pthread_detach(thread);
           	return task;
           }
 
@@ -396,8 +395,14 @@ jobs:
 
           	if (to == from)
           		return;
+          	pthread_mutex_lock(&turn);
           	current = to;
-          	host_switch_stacks(&from->stack_pointer, to->stack_pointer);
+          	to->go = 1;
+          	pthread_cond_signal(&to->wake);
+          	while (!from->go)
+          		pthread_cond_wait(&from->wake, &turn);
+          	from->go = 0;
+          	pthread_mutex_unlock(&turn);
           }
 
           """
@@ -410,24 +415,36 @@ jobs:
                   "#ifdef __vita__\n#define TASK_STACK_SIZE (4u << 20)     /* (the Vita's memory is 256 MB in all: less than the others' 16 MB each) */\n#else\n#define TASK_STACK_SIZE (16u << 20)\n#endif\n", s, count=1)
               if n == 1:
                   done.append("stack size: added")
+              elif re.search(r"(?m)^#\s*define\s+TASK_STACK_SIZE\b", s):
+                  done.append("stack size: left as it is (not the original 16 MB)")
               else:
-                  problems.append("stack size: no '#define TASK_STACK_SIZE (16u << 20)' line found")
+                  problems.append("stack size: no '#define TASK_STACK_SIZE' line found")
 
-          # 2. the Vita's task switch: its registers kept on the task's own stack (its C library has no ucontext)
-          if re.search(r"#\s*elif\s+defined\(\s*__vita__\s*\)", s) or "r4-r11" in s:
-              done.append("Vita task switch: already in")
+          # 2. the Vita's task switch: a thread for each task (its kernel stops a program that makes a system call from a
+          #    stack it did not give: the earlier version of this edit, a stack made by hand, did that)
+          if "VITA_TASK_THREADS" in s:
+              done.append("Vita task switch (threads): already in")
           else:
-              s, n = re.subn(r"(?m)^#else[ \t]*\n[ \t]*\n#include <ucontext\.h>", lambda m: VITA_BRANCH + "#else\n\n#include <ucontext.h>", s, count=1)
-              if n == 1:
-                  done.append("Vita task switch: added")
-              else:
+              stop = re.search(r"(?m)^#else[ \t]*\n[ \t]*\n#include <ucontext\.h>", s)
+              start = re.search(r"(?m)^#elif\s+defined\(\s*__vita__\s*\)[^\n]*\n", s)
+              if not stop:
                   problems.append("Vita task switch: no '#else / #include <ucontext.h>' branch found to put it before")
+              elif start and start.start() < stop.start():
+                  region = s[start.start():stop.start()]
+                  if re.search(r"(?m)^#\s*(elif|else|if|ifdef|ifndef)\b", region[len(start.group(0)):]) and re.search(r"(?m)^#\s*elif\b", region[len(start.group(0)):]):
+                      problems.append("Vita task switch: an earlier Vita branch is mixed with other branches; not replaced")
+                  else:
+                      s = s[:start.start()] + VITA_BRANCH + s[stop.start():]
+                      done.append("Vita task switch (threads): replaced the earlier Vita branch")
+              else:
+                  s = s[:stop.start()] + VITA_BRANCH + s[stop.start():]
+                  done.append("Vita task switch (threads): added")
 
           for line in done:
               print("  " + line)
           print("the Vita lines of tasks.c now:")
           for i, line in enumerate(s.split("\n"), 1):
-              if "__vita__" in line or "TASK_STACK_SIZE" in line or "r4-r11" in line or "host_switch_stacks:" in line:
+              if "__vita__" in line or "TASK_STACK_SIZE" in line or "VITA_TASK_THREADS" in line or "r4-r11" in line:
                   print("%5d: %s" % (i, line.strip()[:110]))
           if problems:
               print("tasks.c does not look as expected:")
@@ -450,11 +467,11 @@ jobs:
       - name: Check that the Vita code is in the source (fails if not)
         run: |
           echo "main.c: audio_resampler x$(grep -c audio_resampler ports/sdl2/main.c), gxm x$(grep -c gxm ports/sdl2/main.c)"
-          echo "tasks.c: host_switch_stacks x$(grep -c host_switch_stacks runtime/src/tasks.c)"
+          echo "tasks.c: VITA_TASK_THREADS x$(grep -c VITA_TASK_THREADS runtime/src/tasks.c)"
           echo "vita.cmake version: $(grep -o 'ORUNNERS_VITA_VERSION "[0-9.]*"' ports/vita/vita.cmake)"
           grep -q audio_resampler ports/sdl2/main.c
           grep -q gxm ports/sdl2/main.c
-          grep -q host_switch_stacks runtime/src/tasks.c
+          grep -q VITA_TASK_THREADS runtime/src/tasks.c
 
       - name: Configure
         run: |
@@ -474,6 +491,19 @@ jobs:
           path: |
             configure.log
             build.log
+          if-no-files-found: ignore
+
+      - name: Make the symbol list (names the addresses of a crash dump)
+        if: always()
+        run: |
+          if [ -f build/bin/OutRunners ]; then arm-vita-eabi-nm -n -C build/bin/OutRunners > symbols.txt; fi
+
+      - name: Keep the symbol list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vita-symbols
+          path: symbols.txt
           if-no-files-found: ignore
 
       - name: Keep the VPK
