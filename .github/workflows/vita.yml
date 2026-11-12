@@ -36,8 +36,97 @@ jobs:
 
       - name: Apply the Vita changes to the source
         run: |
-          # CMakeLists.txt, main.c and tasks.c: edited by the lines' text, each edit only if it is not in yet (so it
-          # does not matter if the repository has the sources as they were, or with an earlier version of these edits)
+          # Every edit is made by the lines' text and only if it is not in yet, so it does not matter whether the
+          # repository has the sources as they were, or with an earlier version of these edits
+          mkdir -p ports/vita
+          # vita_pin.c (the cores, the clocks report): a file of this build's own
+          cat > ports/vita/vita_pin.c <<'VITA_PIN_C'
+          /* Name:        vita_pin.c
+           * Description: the PlayStation Vita build's cores: which of the three an app has each thread runs on, and a report
+           *              of the clocks for the log (written by the build, beside vita_runtime.c)
+           */
+          #ifdef __vita__
+
+          #include <stdio.h>
+          #include <psp2/power.h>
+
+          #ifdef ORUNNERS_VITA_AFFINITY
+          /* (in the SDK's stub libraries: vita.cmake finds which and links it) */
+          int sceKernelChangeThreadCpuAffinityMask(int thid, int cpuAffinityMask);
+          int sceKernelGetThreadId(void);
+          #endif
+
+          /* The calling thread to the cores of 'mask': 0x10000 core 0, 0x20000 core 1, 0x40000 core 2 (an app has these three;
+             the system keeps the fourth). The game and its tasks run on core 0, the video's workers on 1 and 2 */
+          void orunners_vita_pin(int mask)
+          {
+          #ifdef ORUNNERS_VITA_AFFINITY
+          	sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), mask);
+          #else
+          	(void)mask;
+          #endif
+          }
+
+          /* What the log says about the machine, once the log is open */
+          void orunners_vita_report(void)
+          {
+          	fprintf(stderr, "vita: cpu %d MHz, bus %d MHz, gpu %d MHz, cores pinned: %s\n", scePowerGetArmClockFrequency(),
+          		scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(),
+          #ifdef ORUNNERS_VITA_AFFINITY
+          		"yes"
+          #else
+          		"no"
+          #endif
+          		);
+          }
+
+          /* The game's own thread, the one that starts the program, runs on core 0 */
+          __attribute__((constructor)) static void orunners_vita_pin_main(void)
+          {
+          	orunners_vita_pin(0x10000);
+          }
+
+          #endif
+          VITA_PIN_C
+          # vita.cmake: the cores block, appended once; and the version the Vita shows
+          if ! grep -q "VITA_PIN_LIBS" ports/vita/vita.cmake; then
+          cat >> ports/vita/vita.cmake <<'VITA_CMAKE_BLOCK'
+
+          # --- VITA_PIN_LIBS: cores, and the clocks report (appended by the build, once) ---
+          target_sources(OutRunners PRIVATE ports/vita/vita_pin.c)
+          # The calls that pin a thread to a core (the game on core 0, the video's workers on 1 and 2) are in one of the SDK's
+          # stub libraries: find which, link it, and say so; where there is none the game builds and runs without pinning
+          set(VITA_PIN_LIBS "")
+          set(VITA_PIN_FOUND TRUE)
+          file(GLOB VITA_STUBS "$ENV{VITASDK}/arm-vita-eabi/lib/libSce*_stub.a")
+          foreach(symbol sceKernelChangeThreadCpuAffinityMask sceKernelGetThreadId)
+          	set(symbol_library "")
+          	foreach(stub ${VITA_STUBS})
+          		if(NOT symbol_library)
+          			execute_process(COMMAND "$ENV{VITASDK}/bin/arm-vita-eabi-nm" "${stub}" OUTPUT_VARIABLE stub_symbols ERROR_QUIET)
+          			if(stub_symbols MATCHES " ${symbol}\n")
+          				get_filename_component(symbol_library "${stub}" NAME_WE)
+          				string(REGEX REPLACE "^lib" "" symbol_library "${symbol_library}")
+          			endif()
+          		endif()
+          	endforeach()
+          	if(symbol_library)
+          		list(APPEND VITA_PIN_LIBS ${symbol_library})
+          	else()
+          		set(VITA_PIN_FOUND FALSE)
+          	endif()
+          endforeach()
+          if(VITA_PIN_FOUND)
+          	list(REMOVE_DUPLICATES VITA_PIN_LIBS)
+          	message(STATUS "Vita: pinning threads to cores, with ${VITA_PIN_LIBS}")
+          	target_compile_definitions(OutRunners PRIVATE ORUNNERS_VITA_AFFINITY)
+          	target_link_libraries(OutRunners PRIVATE ${VITA_PIN_LIBS})
+          else()
+          	message(STATUS "Vita: the calls that pin threads to cores were not found in the SDK: no pinning")
+          endif()
+          VITA_CMAKE_BLOCK
+          fi
+          sed -i -E 's/(ORUNNERS_VITA_VERSION ")[0-9]+[.][0-9]+(")/\1''01.02''\2/' ports/vita/vita.cmake
           python3 - <<'CMAKE_EDITS'
           import re, sys
 
@@ -255,6 +344,77 @@ jobs:
           #endif
           ''')
 
+          edit("frame skip variable", 'static int vita_frame_skip;',
+          """#ifdef ORUNNERS_HANDHELD
+          static uint64_t pace_video, pace_showing;    /* a handheld's log: the frames' time drawing them, showing them */
+          #endif
+          ""","""#ifdef ORUNNERS_HANDHELD
+          static uint64_t pace_video, pace_showing;    /* a handheld's log: the frames' time drawing them, showing them */
+          #endif
+          #ifdef __vita__
+          static int vita_frame_skip;    /* frameskip.txt: the frames not drawn between two that are (0: all are drawn) */
+          #endif
+          """)
+
+          edit("frame skip", 'frames not drawn: frameskip.txt',
+          """#ifdef ORUNNERS_HANDHELD
+          	const uint64_t start = SDL_GetPerformanceCounter();
+          	uint64_t drawn;
+          ""","""#ifdef __vita__
+          	{
+          		static unsigned frame_count;
+
+          		if (vita_frame_skip > 0 && frame_count++ % ((unsigned)vita_frame_skip + 1) != 0)
+          			return;    /* (frames not drawn: frameskip.txt) */
+          	}
+          #endif
+          #ifdef ORUNNERS_HANDHELD
+          	const uint64_t start = SDL_GetPerformanceCounter();
+          	uint64_t drawn;
+          """)
+
+          edit("workers file", 'workers.txt',
+          """	s32_workers_start(VIDEO_WORKERS);
+          ""","""#ifdef __vita__
+          	/* (two small files in the game's folder try the Vita's speed without a new build: workers.txt, the video's
+          	   threads beside the game's, 0 to 3; frameskip.txt, the frames not drawn between two that are, 0 to 3) */
+          	{
+          		int value, workers = VIDEO_WORKERS;
+          		FILE *file = fopen(VITA_FOLDER "/workers.txt", "r");
+
+          		if (file)
+          		{
+          			if (fscanf(file, "%d", &value) == 1 && value >= 0 && value <= 3)
+          				workers = value;
+          			fclose(file);
+          		}
+          		file = fopen(VITA_FOLDER "/frameskip.txt", "r");
+          		if (file)
+          		{
+          			if (fscanf(file, "%d", &value) == 1 && value >= 0 && value <= 3)
+          				vita_frame_skip = value;
+          			fclose(file);
+          		}
+          		s32_workers_start(workers);
+          		fprintf(stderr, "frameskip: %d\\n", vita_frame_skip);
+          	}
+          #else
+          	s32_workers_start(VIDEO_WORKERS);
+          #endif
+          """)
+
+          edit("clock report", 'orunners_vita_report();',
+          """	fprintf(stderr, "video: %d threads beside the game's\\n", s32_workers_count());
+          ""","""	fprintf(stderr, "video: %d threads beside the game's\\n", s32_workers_count());
+          #ifdef __vita__
+          	{
+          		extern void orunners_vita_report(void);    /* (ports/vita/vita_pin.c) */
+
+          		orunners_vita_report();
+          	}
+          #endif
+          """)
+
           problems = []
           done = []
           def is_in(marker):
@@ -313,8 +473,10 @@ jobs:
           /* The Vita's kernel does not let a program run on a stack it did not get from the kernel: a system call made from
              one stops the program as a stack overflow (what a task with its stack made by hand did on the real machine). So a
              task is a thread of its own, with a stack of its own made by pthreads, and only one of the threads runs at a time:
-             a switch hands the turn to the task that is wanted, and the task that asks waits for its own.  VITA_TASK_THREADS */
+             a switch hands the turn to the task that is wanted, and the task that asks waits for its own.  VITA_TASK_THREADS_PINNED */
           #include <pthread.h>
+
+          void orunners_vita_pin(int mask);    /* (ports/vita/vita_pin.c) */
 
           struct host_task
           {
@@ -347,6 +509,7 @@ jobs:
           {
           	host_task *task = argument;
 
+          	orunners_vita_pin(0x10000);    /* (every task on the game's core: a hand-over there is a plain switch, not a wake-up across cores) */
           	pthread_mutex_lock(&turn);
           	while (!task->go)
           		pthread_cond_wait(&task->wake, &turn);
@@ -422,8 +585,8 @@ jobs:
 
           # 2. the Vita's task switch: a thread for each task (its kernel stops a program that makes a system call from a
           #    stack it did not give: the earlier version of this edit, a stack made by hand, did that)
-          if "VITA_TASK_THREADS" in s:
-              done.append("Vita task switch (threads): already in")
+          if "VITA_TASK_THREADS_PINNED" in s:
+              done.append("Vita task switch (threads, pinned): already in")
           else:
               stop = re.search(r"(?m)^#else[ \t]*\n[ \t]*\n#include <ucontext\.h>", s)
               start = re.search(r"(?m)^#elif\s+defined\(\s*__vita__\s*\)[^\n]*\n", s)
@@ -444,7 +607,7 @@ jobs:
               print("  " + line)
           print("the Vita lines of tasks.c now:")
           for i, line in enumerate(s.split("\n"), 1):
-              if "__vita__" in line or "TASK_STACK_SIZE" in line or "VITA_TASK_THREADS" in line or "r4-r11" in line:
+              if "__vita__" in line or "TASK_STACK_SIZE" in line or "r4-r11" in line or "host_switch_stacks:" in line:
                   print("%5d: %s" % (i, line.strip()[:110]))
           if problems:
               print("tasks.c does not look as expected:")
@@ -463,15 +626,102 @@ jobs:
           else:
               print("runtime/src/tasks.c: the Vita edits were already in")
           TASKS_EDITS
+          python3 - <<'WORKERS_EDITS'
+          import re, sys
+
+          path = "runtime/src/workers.c"
+          s = open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+
+          def norm(t):
+              return re.sub(r"\s+", " ", t)
+
+          def pattern(old):
+              body = r"\s+".join(re.escape(t) for t in old.split())
+              return re.compile(r"(?m)^[ \t]*" + body + (r"[ \t]*\n" if old.endswith("\n") else ""))
+
+          # (name, a piece of the NEW text that says the edit is in, the OLD text it replaces, the NEW text)
+          EDITS = []
+          def edit(name, marker, old, new):
+              EDITS.append((name, marker, old, new))
+
+          edit("worker cores", 'orunners_vita_pin',
+          """static void worker_loop(int number)
+          {
+          	unsigned seen = 0;
+          ""","""#ifdef __vita__
+          void orunners_vita_pin(int mask);    /* (ports/vita/vita_pin.c) */
+          #endif
+
+          static void worker_loop(int number)
+          {
+          	unsigned seen = 0;
+
+          #ifdef __vita__
+          	/* (the app's cores: 0 the game's, 1 and 2 the video's workers, as on the Switch; the system keeps the fourth) */
+          	orunners_vita_pin(0x20000 << (number % 2));
+          #endif
+          """)
+
+          problems = []
+          done = []
+          def is_in(marker):
+              if hasattr(marker, "search"):
+                  return marker.search(s) is not None
+              return norm(marker) in norm(s)
+
+          for name, marker, old, new in EDITS:
+              if is_in(marker):
+                  done.append(name + ": already in")
+                  continue
+              pat = pattern(old)
+              found = pat.findall(s)
+              if len(found) != 1:
+                  problems.append("%s: the text to change was found %d times (wanted 1)" % (name, len(found)))
+                  continue
+              s = pat.sub(lambda m: new, s, count=1)
+              done.append(name + ": added")
+
+          for line in done:
+              print("  " + line)
+          if problems:
+              print("workers.c does not look as expected:")
+              for p in problems:
+                  print("  -", p)
+              print("the lines of worker_loop, for a look:")
+              for i, line in enumerate(s.split("\n"), 1):
+                  if "worker_loop" in line or "orunners_vita_pin" in line:
+                      print("%5d: %s" % (i, line))
+              sys.exit(1)
+
+          print("the Vita lines of workers.c now:")
+          for i, line in enumerate(s.split("\n"), 1):
+              if "__vita__" in line or "orunners_vita_pin" in line:
+                  print("%5d: %s" % (i, line.strip()[:110]))
+          s = s.replace("\n", nl)
+          if s != orig:
+              open(path, "w", encoding="utf-8", newline="").write(s)
+              print("runtime/src/workers.c: the Vita edits are in")
+          else:
+              print("runtime/src/workers.c: the Vita edits were already in")
+          WORKERS_EDITS
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
-          echo "main.c: audio_resampler x$(grep -c audio_resampler ports/sdl2/main.c), gxm x$(grep -c gxm ports/sdl2/main.c)"
+          echo "main.c: audio_resampler x$(grep -c audio_resampler ports/sdl2/main.c), gxm x$(grep -c gxm ports/sdl2/main.c), workers.txt x$(grep -c workers.txt ports/sdl2/main.c), frameskip x$(grep -c vita_frame_skip ports/sdl2/main.c)"
           echo "tasks.c: VITA_TASK_THREADS x$(grep -c VITA_TASK_THREADS runtime/src/tasks.c)"
-          echo "vita.cmake version: $(grep -o 'ORUNNERS_VITA_VERSION "[0-9.]*"' ports/vita/vita.cmake)"
+          echo "workers.c: orunners_vita_pin x$(grep -c orunners_vita_pin runtime/src/workers.c)"
+          echo "vita.cmake: $(grep -o 'ORUNNERS_VITA_VERSION "[0-9.]*"' ports/vita/vita.cmake), cores block x$(grep -c 'appended by the build' ports/vita/vita.cmake)"
           grep -q audio_resampler ports/sdl2/main.c
           grep -q gxm ports/sdl2/main.c
-          grep -q VITA_TASK_THREADS runtime/src/tasks.c
+          grep -q workers.txt ports/sdl2/main.c
+          grep -q vita_frame_skip ports/sdl2/main.c
+          grep -q VITA_TASK_THREADS_PINNED runtime/src/tasks.c
+          grep -q orunners_vita_pin runtime/src/workers.c
+          grep -q VITA_PIN_LIBS ports/vita/vita.cmake
+          test -f ports/vita/vita_pin.c
 
       - name: Configure
         run: |
