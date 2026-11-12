@@ -552,38 +552,46 @@ jobs:
           	return task;
           }
 
-void host_task_switch(host_task *to)
-{
-	static unsigned long count;
-	static long long last;
-	host_task *from = current;
+          void host_task_switch(host_task *to)
+          {
+          	host_task *from = current;
 
-	if (to == from)
-		return;
-	if ((++count & 255) == 0)
-	{
-		struct timeval tv;
-		long long now;
+          	if (to == from)
+          		return;
+          	pthread_mutex_lock(&turn);
+          	current = to;
+          	to->go = 1;
+          	pthread_cond_signal(&to->wake);
+          	while (!from->go)
+          		pthread_cond_wait(&from->wake, &turn);
+          	from->go = 0;
+          	pthread_mutex_unlock(&turn);
+          }
 
-		gettimeofday(&tv, NULL);
-		now = tv.tv_sec * 1000000LL + tv.tv_usec;
-		if (now - last >= 1000000)
-		{
-			fprintf(stderr, "task switches: %lu in %lld ms\n", count, (now - last) / 1000);
-			count = 0;
-			last = now;
-		}
-	}
-	pthread_mutex_lock(&turn);
-	current = to;
-	to->go = 1;
-	pthread_cond_signal(&to->wake);
-	while (!from->go)
-		pthread_cond_wait(&from->wake, &turn);
-	from->go = 0;
-	pthread_mutex_unlock(&turn);
-}
+          """
 
+          # What the switch counts (in the log, once a second: "task switches: N in M ms"). It is put into the
+          # Vita's host_task_switch whether that was just added or was in the sources already
+          COUNTER_CODE = r"""	{
+          		/* VITA_TASK_COUNTER: how many task switches the game makes, in the log once a second */
+          		static unsigned long switch_count;
+          		static long long switch_last;
+
+          		if ((++switch_count & 255) == 0)
+          		{
+          			struct timeval tv;
+          			long long now;
+
+          			gettimeofday(&tv, NULL);
+          			now = tv.tv_sec * 1000000LL + tv.tv_usec;
+          			if (now - switch_last >= 1000000)
+          			{
+          				fprintf(stderr, "task switches: %lu in %lld ms\n", switch_count, (now - switch_last) / 1000);
+          				switch_count = 0;
+          				switch_last = now;
+          			}
+          		}
+          	}
           """
 
           # 1. the Vita's stack size for a task: its memory is 256 MB in all, not 16 MB for each task
@@ -619,11 +627,26 @@ void host_task_switch(host_task *to)
                   s = s[:stop.start()] + VITA_BRANCH + s[stop.start():]
                   done.append("Vita task switch (threads): added")
 
+          # 3. the switch counter, in the Vita's host_task_switch (a line in the log once a second)
+          if "VITA_TASK_COUNTER" in s:
+              done.append("switch counter: already in")
+          else:
+              include_anchor = "#include <pthread.h>\n\nvoid orunners_vita_pin(int mask);"
+              lock_anchor = "\tpthread_mutex_lock(&turn);\n\tcurrent = to;\n"
+              if s.count(include_anchor) != 1:
+                  problems.append("switch counter: the Vita branch's '#include <pthread.h>' was found %d times (wanted 1)" % s.count(include_anchor))
+              elif s.count(lock_anchor) != 1:
+                  problems.append("switch counter: the Vita host_task_switch's lock was found %d times (wanted 1)" % s.count(lock_anchor))
+              else:
+                  s = s.replace(include_anchor, "#include <pthread.h>\n#include <sys/time.h>\n\nvoid orunners_vita_pin(int mask);")
+                  s = s.replace(lock_anchor, COUNTER_CODE + lock_anchor)
+                  done.append("switch counter: added")
+
           for line in done:
               print("  " + line)
           print("the Vita lines of tasks.c now:")
           for i, line in enumerate(s.split("\n"), 1):
-              if "__vita__" in line or "TASK_STACK_SIZE" in line or "r4-r11" in line or "host_switch_stacks:" in line:
+              if "__vita__" in line or "TASK_STACK_SIZE" in line or "r4-r11" in line or "host_switch_stacks:" in line or "VITA_TASK_COUNTER" in line:
                   print("%5d: %s" % (i, line.strip()[:110]))
           if problems:
               print("tasks.c does not look as expected:")
@@ -727,7 +750,7 @@ void host_task_switch(host_task *to)
       - name: Check that the Vita code is in the source (fails if not)
         run: |
           echo "main.c: audio_resampler x$(grep -c audio_resampler ports/sdl2/main.c), gxm x$(grep -c gxm ports/sdl2/main.c), workers.txt x$(grep -c workers.txt ports/sdl2/main.c), frameskip x$(grep -c vita_frame_skip ports/sdl2/main.c)"
-          echo "tasks.c: VITA_TASK_THREADS x$(grep -c VITA_TASK_THREADS runtime/src/tasks.c)"
+          echo "tasks.c: VITA_TASK_THREADS x$(grep -c VITA_TASK_THREADS runtime/src/tasks.c), VITA_TASK_COUNTER x$(grep -c VITA_TASK_COUNTER runtime/src/tasks.c)"
           echo "workers.c: orunners_vita_pin x$(grep -c orunners_vita_pin runtime/src/workers.c)"
           echo "vita.cmake: $(grep -o 'ORUNNERS_VITA_VERSION "[0-9.]*"' ports/vita/vita.cmake), cores block x$(grep -c 'appended by the build' ports/vita/vita.cmake)"
           grep -q audio_resampler ports/sdl2/main.c
@@ -735,6 +758,7 @@ void host_task_switch(host_task *to)
           grep -q workers.txt ports/sdl2/main.c
           grep -q vita_frame_skip ports/sdl2/main.c
           grep -q VITA_TASK_THREADS_PINNED runtime/src/tasks.c
+          grep -q VITA_TASK_COUNTER runtime/src/tasks.c
           grep -q orunners_vita_pin runtime/src/workers.c
           grep -q VITA_PIN_LIBS ports/vita/vita.cmake
           test -f ports/vita/vita_pin.c
@@ -747,7 +771,7 @@ void host_task_switch(host_task *to)
 
       - name: Build
         run: |
-          cmake --build build/vita --target OutRunners.vpk 2>&1 | tee build.log
+          cmake --build build/vita --target OutRunners.vpk -- -v 2>&1 | tee build.log
 
       - name: Keep the logs
         if: always()
