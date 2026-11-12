@@ -493,6 +493,15 @@ jobs:
           			(double)pace_controls * per_frame, (double)pace_sound * per_frame, (double)pace_queue * per_frame,
           			(double)pace_extras * per_frame,
           			((double)(now - pace_start) - (double)pace_work - (double)pace_extras) * per_frame);
+          		{
+          			/* (runtime/src/video.c, in microseconds: where the frame's video went) */
+          			extern uint64_t s32_video_pace_layers, s32_video_pace_mix;
+          
+          			fprintf(stderr, "  its layers %.1f ms, mixing them %.1f\\n",
+          				(double)s32_video_pace_layers / 1000.0 / pace_frames,
+          				(double)s32_video_pace_mix / 1000.0 / pace_frames);
+          			s32_video_pace_layers = s32_video_pace_mix = 0;
+          		}
           		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
           			(double)pace_sprites * per_frame,
           			((double)pace_work - (double)pace_video - (double)pace_showing - (double)pace_controls
@@ -888,26 +897,128 @@ jobs:
           orig = s
           nl = "\r\n" if "\r\n" in s else "\n"
           s = s.replace("\r\n", "\n")
+          done, problems = [], []
 
+          # --- 1. the sprite erase ---
           # s32_video_sprites erases the sprite buffer of EVERY screen, 218 KB each and a pixel at a time, while
           # draw_sprite already leaves a screen the port does not show alone: erasing that one is work for nothing.
           # The Vita shows one screen, so this saves 218 KB of writes a frame, and what is left is a memset
-          PAT = re.compile(r"(?m)^[ \t]*for \(size_t index = 0; index < \(size_t\)HEIGHT \* WIDTH; index\+\+\)\n[ \t]*shown\[index\] = 0xffff;\n")
-          NEW = ("\t\t\tif (!bit((uint32_t)video.screens_shown, screen))\n"
-                 "\t\t\t\tcontinue;    /* (a screen the port does not show: draw_sprite leaves its sprites alone too) */\n"
-                 "\t\t\tmemset(shown, 0xff, (size_t)HEIGHT * WIDTH * sizeof(shown[0]));    /* (0xffff a pixel: no sprite there) */\n")
+          ERASE = re.compile(r"(?m)^[ \t]*for \(size_t index = 0; index < \(size_t\)HEIGHT \* WIDTH; index\+\+\)\n[ \t]*shown\[index\] = 0xffff;\n")
+          ERASE_NEW = ("\t\t\tif (!bit((uint32_t)video.screens_shown, screen))\n"
+                       "\t\t\t\tcontinue;    /* (a screen the port does not show: draw_sprite leaves its sprites alone too) */\n"
+                       "\t\t\tmemset(shown, 0xff, (size_t)HEIGHT * WIDTH * sizeof(shown[0]));    /* (0xffff a pixel: no sprite there) */\n")
 
           if "draw_sprite leaves its sprites alone too" in s:
-              print("  sprite erase: already in")
-          elif len(PAT.findall(s)) != 1:
-              print("video.c does not look as expected: the sprite erase loop was found %d times (wanted 1)" % len(PAT.findall(s)))
+              done.append("sprite erase: already in")
+          elif len(ERASE.findall(s)) != 1:
+              problems.append("sprite erase: the loop was found %d times (wanted 1)" % len(ERASE.findall(s)))
+          else:
+              s = ERASE.sub(lambda m: ERASE_NEW, s, count=1)
+              done.append("sprite erase: added")
+
+          # --- 2. a sprite outside this thread's band, left before the costly part of the setup ---
+          # draw_sprites gives each thread a band of the frame's rows and EVERY thread walks the WHOLE list, so the
+          # setup of each sprite is paid once per thread while only the rows are shared out. The rows a sprite covers
+          # are known from its entry alone, so the ones this thread cannot draw are dropped before the indirect table
+          # is read and before the two divides that work out the zoom (the Cortex-A9 has no divide instruction: each
+          # is a call to __aeabi_idiv). Placing it is moved up for that; nothing between the two places touches y.
+          Y_LINE = "\ty = sign_extend(sprite_word(entry + 4), 12) + (bit(flags, 5) ? y_offset : 0);\n"
+          Y_SWITCH = ("\tswitch ((flags >> 2) & 3)\n"
+                      "\t{\n"
+                      "\t\tcase 0:\n"
+                      "\t\tcase 3: y -= (height - 1) / 2; break;\n"
+                      "\t\tcase 1: y -= height - 1; break;\n"
+                      "\t\tdefault: break;\n"
+                      "\t}\n")
+          ANCHOR = "\tif (sprite.indirect)\n\t{\n"
+          MOVED = ("\t/* Where its rows fall, worked out before the rest of it. draw_sprites hands each thread a band of\n"
+                   "\t   the frame's rows and every thread walks the whole list, so a sprite this thread has no row of is\n"
+                   "\t   dropped here, before the indirect table is read and before the zoom is divided out. A sprite\n"
+                   "\t   covers the same rows whichever way it is flipped (flip_y only turns them round below), so this\n"
+                   "\t   is the row loop's own test made once. An observer watching keeps draw_sprites on one thread and\n"
+                   "\t   wants every sprite, band or not. */\n"
+                   + Y_LINE + Y_SWITCH +
+                   "\tif (s32_video_sprite_observer == NULL && (y + height - 1 < inside->top || y > inside->bottom))\n"
+                   "\t\treturn taken;\n"
+                   "\n")
+
+          if "the row loop's own test made once" in s:
+              done.append("sprite band: already in")
+          elif s.count(Y_LINE) != 1 or s.count(Y_SWITCH) != 1 or s.count(ANCHOR) != 1:
+              problems.append("sprite band: y line x%d, y switch x%d, anchor x%d (wanted 1 each)"
+                              % (s.count(Y_LINE), s.count(Y_SWITCH), s.count(ANCHOR)))
+          elif s.index(ANCHOR) > s.index(Y_LINE):
+              problems.append("sprite band: 'if (sprite.indirect)' is not above the placement; not moved")
+          else:
+              s = s.replace(Y_LINE, "", 1)
+              s = s.replace(Y_SWITCH, "", 1)
+              s = s.replace(ANCHOR, MOVED + ANCHOR, 1)
+              done.append("sprite band: added")
+
+
+          # --- 3. splitting the frame's video in two: drawing the layers, and mixing them into the screen ---
+          # s32_video_draw_frame is the biggest item in the Vita's log and nothing says where inside it the time
+          # goes. These two counters are microseconds, read and zeroed by the port (ports/sdl2/main.c)
+          CLOCK = """#ifdef __vita__
+          #include <time.h>
+
+          /* (the Vita's log: where s32_video_draw_frame's time goes, in microseconds; the port reads them and puts
+             them back to nothing every time it writes a line) */
+          uint64_t s32_video_pace_layers, s32_video_pace_mix;
+
+          static uint64_t video_microseconds(void)
+          {
+          \tstruct timespec moment;
+
+          \tclock_gettime(CLOCK_MONOTONIC, &moment);
+          \treturn (uint64_t)moment.tv_sec * 1000000u + (uint64_t)moment.tv_nsec / 1000u;
+          }
+          #endif
+
+          void s32_video_draw_frame(void)
+          """
+          DRAW_OLD = """\t\tif (drawn < 0)
+          \t\t\tdrawn = draw_layers(wanted);
+          \t\tmix(screen, drawn);
+          """
+          DRAW_NEW = """#ifdef __vita__
+          \t\t{
+          \t\t\tconst uint64_t layers_start = video_microseconds();
+          \t\t\tuint64_t mix_start;
+
+          \t\t\tif (drawn < 0)
+          \t\t\t\tdrawn = draw_layers(wanted);
+          \t\t\tmix_start = video_microseconds();
+          \t\t\ts32_video_pace_layers += mix_start - layers_start;
+          \t\t\tmix(screen, drawn);
+          \t\t\ts32_video_pace_mix += video_microseconds() - mix_start;
+          \t\t}
+          #else
+          \t\tif (drawn < 0)
+          \t\t\tdrawn = draw_layers(wanted);
+          \t\tmix(screen, drawn);
+          #endif
+          """
+
+          if "s32_video_pace_layers" in s:
+              done.append("video timing: already in")
+          elif s.count("void s32_video_draw_frame(void)\n") != 1 or s.count(DRAW_OLD) != 1:
+              problems.append("video timing: draw_frame x%d, the layers/mix lines x%d (wanted 1 each)"
+                              % (s.count("void s32_video_draw_frame(void)\n"), s.count(DRAW_OLD)))
+          else:
+              s = s.replace("void s32_video_draw_frame(void)\n", CLOCK, 1)
+              s = s.replace(DRAW_OLD, DRAW_NEW, 1)
+              done.append("video timing: added")
+          for line in done:
+              print("  " + line)
+          if problems:
+              print("video.c does not look as expected:")
+              for p in problems:
+                  print("  -", p)
               for i, line in enumerate(s.split("\n"), 1):
-                  if "0xffff" in line or "s32_video_sprites" in line:
+                  if "sprite.indirect" in line or "sign_extend(sprite_word(entry + 4)" in line or "0xffff" in line:
                       print("%5d: %s" % (i, line.strip()[:110]))
               sys.exit(1)
-          else:
-              s = PAT.sub(lambda m: NEW, s, count=1)
-              print("  sprite erase: added")
 
           s = s.replace("\n", nl)
           if s != orig:
