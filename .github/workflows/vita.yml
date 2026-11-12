@@ -552,21 +552,37 @@ jobs:
           	return task;
           }
 
-          void host_task_switch(host_task *to)
-          {
-          	host_task *from = current;
+void host_task_switch(host_task *to)
+{
+	static unsigned long count;
+	static long long last;
+	host_task *from = current;
 
-          	if (to == from)
-          		return;
-          	pthread_mutex_lock(&turn);
-          	current = to;
-          	to->go = 1;
-          	pthread_cond_signal(&to->wake);
-          	while (!from->go)
-          		pthread_cond_wait(&from->wake, &turn);
-          	from->go = 0;
-          	pthread_mutex_unlock(&turn);
-          }
+	if (to == from)
+		return;
+	if ((++count & 255) == 0)
+	{
+		struct timeval tv;
+		long long now;
+
+		gettimeofday(&tv, NULL);
+		now = tv.tv_sec * 1000000LL + tv.tv_usec;
+		if (now - last >= 1000000)
+		{
+			fprintf(stderr, "task switches: %lu in %lld ms\n", count, (now - last) / 1000);
+			count = 0;
+			last = now;
+		}
+	}
+	pthread_mutex_lock(&turn);
+	current = to;
+	to->go = 1;
+	pthread_cond_signal(&to->wake);
+	while (!from->go)
+		pthread_cond_wait(&from->wake, &turn);
+	from->go = 0;
+	pthread_mutex_unlock(&turn);
+}
 
           """
 
