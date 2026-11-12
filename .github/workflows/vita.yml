@@ -420,6 +420,7 @@ jobs:
           """static uint64_t pace_video, pace_showing;""",
           """#ifdef __vita__
           static uint64_t pace_controls, pace_sound, pace_queue, pace_extras;    /* the Vita's log: the controls, the sound, queueing it, the frame's end in all */
+          static uint64_t pace_sprites;    /* and the board's sprites, drawn while the frame runs: pace_video does not count them */
           #endif
           static uint64_t pace_video, pace_showing;""")
 
@@ -492,10 +493,60 @@ jobs:
           			(double)pace_controls * per_frame, (double)pace_sound * per_frame, (double)pace_queue * per_frame,
           			(double)pace_extras * per_frame,
           			((double)(now - pace_start) - (double)pace_work - (double)pace_extras) * per_frame);
-          		pace_controls = pace_sound = pace_queue = pace_extras = 0;
+          		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
+          			(double)pace_sprites * per_frame,
+          			((double)pace_work - (double)pace_video - (double)pace_showing - (double)pace_controls
+          				- (double)pace_sprites) * per_frame);
+          		pace_controls = pace_sound = pace_queue = pace_extras = pace_sprites = 0;
           #endif
           		pace_start = now;
           		pace_frames = 0;""")
+
+
+          edit("sharp pixels", 'PIXELS_SHARP',
+          '''	console_window_settings.pixels = PIXELS_SMOOTH;
+          	console_window_settings.vertical = false;''','''#ifdef __vita__
+          	/* SMOOTH draws the picture a second time, into a render target of its own, and the GXM driver ends and
+          	   begins a scene of its own for it: on the Vita a whole extra pass a frame costs more than soft edges
+          	   are worth (OPTIONS > VIDEO still offers them) */
+          	console_window_settings.pixels = PIXELS_SHARP;
+          #else
+          	console_window_settings.pixels = PIXELS_SMOOTH;
+          #endif
+          	console_window_settings.vertical = false;''')
+
+
+          edit("timing sprites", 'sprites_due_timed',
+          """static void on_frame_shown(void)
+          {""","""#ifdef __vita__
+          /* The board's sprites are drawn while the frame runs, from a write to the sprite control register
+             (s32_board.sprites_due), and not in s32_video_draw_frame: pace_video does not count them, so the log put
+             them in with the game's own code. The port wraps whatever the game installed, the first frame it sees it */
+          static void (*sprites_due_game)(bool, bool);
+
+          static void sprites_due_timed(bool erase, bool draw)
+          {
+          	const uint64_t sprites_start = SDL_GetPerformanceCounter();
+
+          	sprites_due_game(erase, draw);
+          	pace_sprites += SDL_GetPerformanceCounter() - sprites_start;
+          }
+
+          static void time_the_sprites(void)
+          {
+          	if (s32_board.sprites_due && s32_board.sprites_due != sprites_due_timed)
+          	{
+          		sprites_due_game = s32_board.sprites_due;
+          		s32_board.sprites_due = sprites_due_timed;
+          	}
+          }
+          #endif
+
+          static void on_frame_shown(void)
+          {
+          #ifdef __vita__
+          	time_the_sprites();
+          #endif""")
 
 
           problems = []
@@ -829,6 +880,42 @@ jobs:
           else:
               print("runtime/src/workers.c: the Vita edits were already in")
           WORKERS_EDITS
+          python3 - <<'VIDEO_EDITS'
+          import io, re, sys
+
+          path = "runtime/src/video.c"
+          s = io.open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+
+          # s32_video_sprites erases the sprite buffer of EVERY screen, 218 KB each and a pixel at a time, while
+          # draw_sprite already leaves a screen the port does not show alone: erasing that one is work for nothing.
+          # The Vita shows one screen, so this saves 218 KB of writes a frame, and what is left is a memset
+          PAT = re.compile(r"(?m)^[ \t]*for \(size_t index = 0; index < \(size_t\)HEIGHT \* WIDTH; index\+\+\)\n[ \t]*shown\[index\] = 0xffff;\n")
+          NEW = ("\t\t\tif (!bit((uint32_t)video.screens_shown, screen))\n"
+                 "\t\t\t\tcontinue;    /* (a screen the port does not show: draw_sprite leaves its sprites alone too) */\n"
+                 "\t\t\tmemset(shown, 0xff, (size_t)HEIGHT * WIDTH * sizeof(shown[0]));    /* (0xffff a pixel: no sprite there) */\n")
+
+          if "draw_sprite leaves its sprites alone too" in s:
+              print("  sprite erase: already in")
+          elif len(PAT.findall(s)) != 1:
+              print("video.c does not look as expected: the sprite erase loop was found %d times (wanted 1)" % len(PAT.findall(s)))
+              for i, line in enumerate(s.split("\n"), 1):
+                  if "0xffff" in line or "s32_video_sprites" in line:
+                      print("%5d: %s" % (i, line.strip()[:110]))
+              sys.exit(1)
+          else:
+              s = PAT.sub(lambda m: NEW, s, count=1)
+              print("  sprite erase: added")
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              io.open(path, "w", encoding="utf-8", newline="").write(s)
+              print("runtime/src/video.c: the Vita edits are in")
+          else:
+              print("runtime/src/video.c: the Vita edits were already in")
+          VIDEO_EDITS
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
