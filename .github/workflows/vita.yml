@@ -570,6 +570,17 @@ jobs:
           				(double)s32_io_reads / pace_frames, (double)s32_io_writes / pace_frames);
           			s32_io_reads = s32_io_writes = 0;
           		}
+          		{
+          			/* (runtime/src/sound_cpu.c: the sound program's own time on core 0, inside the game's frame) */
+          			extern uint64_t s32_sound_program_us;
+          			extern uint32_t s32_sound_program_calls;
+
+          			fprintf(stderr, "  the sound program %.1f ms a frame, over %.0f catch-ups\\n",
+          				(double)s32_sound_program_us / 1000.0 / pace_frames,
+          				(double)s32_sound_program_calls / pace_frames);
+          			s32_sound_program_us = 0;
+          			s32_sound_program_calls = 0;
+          		}
           		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
           			(double)pace_sprites * per_frame,
           			((double)pace_work - (double)pace_video - (double)pace_showing - (double)pace_controls
@@ -1247,6 +1258,53 @@ jobs:
           else:
               swap("on_time_passes", OLD_TP, NEW_TP)
 
+
+          # --- 4. how long the sound program itself holds core 0 ------------------------------------------
+          # s32_wait calls time_passes in the middle of the game's frame, and on_time_passes runs the decompiled
+          # sound program until the Z80 catches up. That time is spent on core 0 and lands in the Vita log's
+          # "game's own code", not in its "sound". Nothing has ever measured it, and it may be a large part of
+          # the 15.4 ms. The call count is reported too, so the timer's own overhead can be judged.
+          CLOCK = """#ifdef __vita__
+          #include <time.h>
+
+          /* (the Vita's log: the sound program's own time on core 0, in microseconds, and how often it is asked
+             to catch up; the port reads both and puts them back to nothing every time it writes a line) */
+          uint64_t s32_sound_program_us;
+          uint32_t s32_sound_program_calls;
+
+          static uint64_t sound_microseconds(void)
+          {
+          \tstruct timespec moment;
+
+          \tclock_gettime(CLOCK_MONOTONIC, &moment);
+          \treturn (uint64_t)moment.tv_sec * 1000000u + (uint64_t)moment.tv_nsec / 1000u;
+          }
+
+          static void on_time_passes_work(uint64_t until);
+
+          static void on_time_passes(uint64_t until)
+          {
+          \tconst uint64_t start = sound_microseconds();
+
+          \ton_time_passes_work(until);
+          \ts32_sound_program_us += sound_microseconds() - start;
+          \ts32_sound_program_calls++;
+          }
+
+          static void on_time_passes_work(uint64_t until)
+          #else
+          static void on_time_passes(uint64_t until)
+          #endif
+          """
+          OLD_SIG = "static void on_time_passes(uint64_t until)\n"
+
+          if "s32_sound_program_us" in s:
+              done.append("sound program timing: already in")
+          elif s.count(OLD_SIG) != 1:
+              problems.append("sound program timing: on_time_passes was found %d times (wanted 1)" % s.count(OLD_SIG))
+          else:
+              s = s.replace(OLD_SIG, CLOCK, 1)
+              done.append("sound program timing: added")
           for line in done:
               print("  " + line)
           if problems:
