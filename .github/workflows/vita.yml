@@ -991,46 +991,6 @@ jobs:
               s = ERASE.sub(lambda m: ERASE_NEW, s, count=1)
               done.append("sprite erase: added")
 
-          # --- 2. a sprite outside this thread's band, left before the costly part of the setup ---
-          # draw_sprites gives each thread a band of the frame's rows and EVERY thread walks the WHOLE list, so the
-          # setup of each sprite is paid once per thread while only the rows are shared out. The rows a sprite covers
-          # are known from its entry alone, so the ones this thread cannot draw are dropped before the indirect table
-          # is read and before the two divides that work out the zoom (the Cortex-A9 has no divide instruction: each
-          # is a call to __aeabi_idiv). Placing it is moved up for that; nothing between the two places touches y.
-          Y_LINE = "\ty = sign_extend(sprite_word(entry + 4), 12) + (bit(flags, 5) ? y_offset : 0);\n"
-          Y_SWITCH = ("\tswitch ((flags >> 2) & 3)\n"
-                      "\t{\n"
-                      "\t\tcase 0:\n"
-                      "\t\tcase 3: y -= (height - 1) / 2; break;\n"
-                      "\t\tcase 1: y -= height - 1; break;\n"
-                      "\t\tdefault: break;\n"
-                      "\t}\n")
-          ANCHOR = "\tif (sprite.indirect)\n\t{\n"
-          MOVED = ("\t/* Where its rows fall, worked out before the rest of it. draw_sprites hands each thread a band of\n"
-                   "\t   the frame's rows and every thread walks the whole list, so a sprite this thread has no row of is\n"
-                   "\t   dropped here, before the indirect table is read and before the zoom is divided out. A sprite\n"
-                   "\t   covers the same rows whichever way it is flipped (flip_y only turns them round below), so this\n"
-                   "\t   is the row loop's own test made once. An observer watching keeps draw_sprites on one thread and\n"
-                   "\t   wants every sprite, band or not. */\n"
-                   + Y_LINE + Y_SWITCH +
-                   "\tif (s32_video_sprite_observer == NULL && (y + height - 1 < inside->top || y > inside->bottom))\n"
-                   "\t\treturn taken;\n"
-                   "\n")
-
-          if "the row loop's own test made once" in s:
-              done.append("sprite band: already in")
-          elif s.count(Y_LINE) != 1 or s.count(Y_SWITCH) != 1 or s.count(ANCHOR) != 1:
-              problems.append("sprite band: y line x%d, y switch x%d, anchor x%d (wanted 1 each)"
-                              % (s.count(Y_LINE), s.count(Y_SWITCH), s.count(ANCHOR)))
-          elif s.index(ANCHOR) > s.index(Y_LINE):
-              problems.append("sprite band: 'if (sprite.indirect)' is not above the placement; not moved")
-          else:
-              s = s.replace(Y_LINE, "", 1)
-              s = s.replace(Y_SWITCH, "", 1)
-              s = s.replace(ANCHOR, MOVED + ANCHOR, 1)
-              done.append("sprite band: added")
-
-
           # --- 3. splitting the frame's video in two: drawing the layers, and mixing them into the screen ---
           # s32_video_draw_frame is the biggest item in the Vita's log and nothing says where inside it the time
           # goes. These two counters are microseconds, read and zeroed by the port (ports/sdl2/main.c)
