@@ -126,6 +126,24 @@ jobs:
           endif()
           VITA_CMAKE_BLOCK
           fi
+          if ! grep -q "VITA_LTO" ports/vita/vita.cmake; then
+          cat >> ports/vita/vita.cmake <<'VITA_LTO_BLOCK'
+
+          # --- VITA_LTO: the whole game built as one unit (appended by the build, once) ---
+          # "the game's own code" is 15.4 ms of a 41 ms frame and it is not board dispatch: the log counts only about
+          # 480 reads and writes a frame, which is microseconds. It is the decompiled code itself, and decompiled code
+          # is thousands of small functions spread over many files, which is exactly what the linker can do something
+          # about. Added to the targets rather than to CMAKE_C_FLAGS, because the toolchain keeps -Wl,-q in there and
+          # vita_create_self needs it.
+          foreach(lto_target s32runtime orunners_game_console orunners_sound OutRunners)
+          	if(TARGET ${lto_target})
+          		target_compile_options(${lto_target} PRIVATE -flto -ffat-lto-objects)
+          	endif()
+          endforeach()
+          target_link_options(OutRunners PRIVATE -flto -O3)
+          message(STATUS "Vita: building the game with link-time optimisation")
+          VITA_LTO_BLOCK
+          fi
           sed -i -E 's/(ORUNNERS_VITA_VERSION ")[0-9]+[.][0-9]+(")/\1''01.02''\2/' ports/vita/vita.cmake
           python3 - <<'CMAKE_EDITS'
           import re, sys
