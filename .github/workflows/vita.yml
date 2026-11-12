@@ -1062,6 +1062,28 @@ jobs:
               s = s.replace("void s32_video_draw_frame(void)\n", CLOCK, 1)
               s = s.replace(DRAW_OLD, DRAW_NEW, 1)
               done.append("video timing: added")
+
+          # --- 4. tile_pen without a divide on the path that never needs one -------------------------------
+          # tile_pen runs once per tilemap pixel and its modulo is a call to __aeabi_uidiv (the Cortex-A9 has no
+          # divide instruction). The packed assets hold 0x8000 tiles, a power of two, so the wrap is an AND.
+          # A mask is also the only form that is always fast: page_pixel builds tile as bank << 13 | 13 bits,
+          # so a bank of 4 or more puts tile past the count, and a plain `tile < count` guard would fall back
+          # to the divide on every one of those pixels. The checks load a set of their own size, which may be
+          # any count, and keep the modulo.
+          OLD_TP = "\treturn video.graphics.tile_pens[tile % video.graphics.tile_count][y * 16 + x];\n"
+          NEW_TP = ("\tconst uint32_t count = video.graphics.tile_count;\n"
+                    "\t/* the board's set is 0x8000 tiles, a power of two: the wrap is an AND, not __aeabi_uidiv */\n"
+                    "\tconst uint32_t index = (count & (count - 1u)) == 0u ? (tile & (count - 1u)) : tile % count;\n"
+                    "\n"
+                    "\treturn video.graphics.tile_pens[index][y * 16 + x];\n")
+
+          if "the wrap is an AND, not __aeabi_uidiv" in s:
+              done.append("tile_pen: already in")
+          elif s.count(OLD_TP) != 1:
+              problems.append("tile_pen: the return was found %d times (wanted 1)" % s.count(OLD_TP))
+          else:
+              s = s.replace(OLD_TP, NEW_TP, 1)
+              done.append("tile_pen: added")
           for line in done:
               print("  " + line)
           if problems:
@@ -1125,6 +1147,124 @@ jobs:
           else:
               print("runtime/src/machine.c: the Vita edits were already in")
           MACHINE_EDITS
+          python3 - <<'SOUND_CPU_EDITS'
+          import io, sys
+
+          path = "runtime/src/sound_cpu.c"
+          s = io.open(path, encoding="utf-8", newline="").read()
+          orig = s
+          nl = "\r\n" if "\r\n" in s else "\n"
+          s = s.replace("\r\n", "\n")
+          done, problems = [], []
+
+          def swap(name, old, new):
+              global s
+              if s.count(old) != 1:
+                  problems.append("%s: the text to change was found %d times (wanted 1)" % (name, s.count(old)))
+                  return
+              s = s.replace(old, new, 1)
+              done.append(name + ": added")
+
+          # --- 1. board_time without a divide ---------------------------------------------------------------
+          # The board is 20 MHz and the sound clock 8 MHz: exactly 5/2. The Cortex-A9 has no divide instruction,
+          # so a 64-bit divide is a call to __aeabi_uldivmod, and z80_block runs board_time for EVERY basic block
+          # of the sound program -- thousands of times a frame, on core 0, inside the game's own time.
+          OLD_BT = """static uint64_t board_time(uint64_t cycles)
+          {
+          \treturn cycles * S32_CPU_CLOCK / S32_SOUND_CLOCK;
+          }
+          """
+          NEW_BT = """_Static_assert(S32_CPU_CLOCK * 2u == S32_SOUND_CLOCK * 5u, "board_time: the clocks are no longer 5/2");
+
+          static uint64_t board_time(uint64_t cycles)
+          {
+          \t/* 20 MHz over 8 MHz is exactly 5/2, so this is a multiply and a shift and not a 64-bit divide. The
+          \t   Cortex-A9 has no divide instruction: the divide this replaces was a call to __aeabi_uldivmod, and
+          \t   z80_block runs it for every basic block of the sound program. Exact while cycles * 5 fits in 64
+          \t   bits, which at the Z80's 133,333 cycles a frame is a few hundred thousand years. */
+          \treturn (cycles * 5u) >> 1;
+          }
+          """
+          if "the clocks are no longer 5/2" in s:
+              done.append("board_time: already in")
+          else:
+              swap("board_time", OLD_BT, NEW_BT)
+
+          # --- 2. z80_block works out the time once a turn round the loop, not twice ------------------------
+          # z80.clock cannot change between the board_time at the top of an iteration and the break below it,
+          # so the value the loop last computed is the one the store wants.
+          OLD_BLK = """void z80_block(int cycles, int fetches)
+          {
+          \tfor (;;)
+          \t{
+          \t\tsound_chips_timers_due(board_time(z80.clock));
+          \t\tif (!z80.interrupts || z80.after_ei || !z80.line)
+          \t\t\tbreak;
+          \t\tz80.interrupts = false;
+          \t\tz80.clock += INTERRUPT_CYCLES;
+          \t\tz80.refresh++;
+          \t\tsound_irq();
+          \t}
+          \tz80.after_ei = false;
+          \ts32_board.sound_cycles = board_time(z80.clock);
+          """
+          NEW_BLK = """void z80_block(int cycles, int fetches)
+          {
+          \tuint64_t now;
+
+          \tfor (;;)
+          \t{
+          \t\tnow = board_time(z80.clock);
+          \t\tsound_chips_timers_due(now);
+          \t\tif (!z80.interrupts || z80.after_ei || !z80.line)
+          \t\t\tbreak;
+          \t\tz80.interrupts = false;
+          \t\tz80.clock += INTERRUPT_CYCLES;
+          \t\tz80.refresh++;
+          \t\tsound_irq();
+          \t}
+          \tz80.after_ei = false;
+          \ts32_board.sound_cycles = now;    /* (the break is before anything moves z80.clock: this is that time) */
+          """
+          if "uint64_t now;" in s:
+              done.append("z80_block: already in")
+          else:
+              swap("z80_block", OLD_BLK, NEW_BLK)
+
+          # --- 3. on_time_passes converts the time once, not twice ------------------------------------------
+          OLD_TP = """\t\tif (z80.clock < z80_time(until))
+          \t\t\tz80.clock = z80_time(until);
+          """
+          NEW_TP = """\t\t{
+          \t\t\tconst uint64_t start = z80_time(until);    /* (once: this one is still a divide) */
+
+          \t\t\tif (z80.clock < start)
+          \t\t\t\tz80.clock = start;
+          \t\t}
+          """
+          if "this one is still a divide" in s:
+              done.append("on_time_passes: already in")
+          else:
+              swap("on_time_passes", OLD_TP, NEW_TP)
+
+          for line in done:
+              print("  " + line)
+          if problems:
+              print("sound_cpu.c does not look as expected:")
+              for p in problems:
+                  print("  -", p)
+              for i, line in enumerate(s.split("\n"), 1):
+                  if "board_time" in line or "z80_time" in line:
+                      print("%5d: %s" % (i, line.strip()[:110]))
+              sys.exit(1)
+
+          s = s.replace("\n", nl)
+          if s != orig:
+              io.open(path, "w", encoding="utf-8", newline="").write(s)
+              print("runtime/src/sound_cpu.c: the Vita edits are in")
+          else:
+              print("runtime/src/sound_cpu.c: the Vita edits were already in")
+          SOUND_CPU_EDITS
 
       - name: Check that the Vita code is in the source (fails if not)
         run: |
@@ -1156,6 +1296,20 @@ jobs:
       - name: Build
         run: |
           cmake --build build/vita --target OutRunners.vpk -- -v 2>&1 | tee build.log
+
+      - name: Count the divide libcalls left in the build
+        run: |
+          # The Cortex-A9 has no divide instruction, so every / and % by a non-constant is a
+          # call. These counts say whether the hot ones really went.
+          for o in build/vita/CMakeFiles/s32runtime.dir/runtime/src/sound_cpu.c.obj \
+                   build/vita/CMakeFiles/s32runtime.dir/runtime/src/video.c.obj; do
+            if [ -f "$o" ]; then
+              echo "$(basename $o): $(arm-vita-eabi-objdump -d "$o" 2>/dev/null \
+                | grep -cE 'bl.*__aeabi_(uldivmod|ldivmod|uidiv|idiv)') divide libcalls"
+            else
+              echo "$(basename $o): not found (LTO may have renamed it)"
+            fi
+          done
 
       - name: Keep the logs
         if: always()
