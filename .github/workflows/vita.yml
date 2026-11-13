@@ -503,12 +503,12 @@ jobs:
           		if (file)
           		{
           			if (fscanf(file, "%d", &value) == 1)
-          				vita_bench = value != 0;
+          				vita_bench = value >= 0 && value <= 2 ? value : 0;    /* (1 a call a quad, 2 one batched call) */
           			fclose(file);
           		}
           		s32_workers_start(workers);
           		fprintf(stderr, "frameskip: %d, audio stretched to fill: %s, gpu bench: %s\\n", vita_frame_skip,
-          			resample_stretch ? "yes" : "no", vita_bench ? "on" : "off");
+          			resample_stretch ? "yes" : "no", vita_bench == 2 ? "batched" : vita_bench == 1 ? "a call a quad" : "off");
           	}
           #else
           	s32_workers_start(VIDEO_WORKERS);
@@ -635,7 +635,9 @@ jobs:
           		if (vita_bench)
           		{
           			/* (gpubench.txt: the extra quads every frame of this line drew; then on to the next level) */
-          			fprintf(stderr, "  gpu bench: %d extra quads a frame\\n", vita_bench_quads_of[vita_bench_level % 5]);
+          			fprintf(stderr, "  gpu bench: %d extra quads a frame, %s%s\\n", vita_bench_quads_of[vita_bench_level % 4],
+          				vita_bench == 2 ? "one batched call" : "a call each",
+          				vita_bench_failed ? "  *** SDL_RenderGeometry REFUSED: this measures nothing ***" : "");
           			vita_bench_level++;
           		}
           		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
@@ -697,21 +699,31 @@ jobs:
           edit("gpu bench", 'vita_bench_draw(void)',
           '''/* The pixels the window shows: the console's OPTIONS > VIDEO; the arcade's F3, sharp or smooth */
           ''','''#ifdef __vita__
-          /* gpubench.txt (1): extra textured quads drawn over every frame -- none, 500, 1000, 2000, then 4000, a
-             level for each line of the log -- to see what the SDL GXM renderer costs a quad on this CPU. A renderer
-             that draws the picture as quads on the GPU stands or falls on that number: a full frame is 1500-2500
-             quads, and submitting them is CPU work on the same cores the software renderer uses today. */
-          static bool vita_bench;
-          static int vita_bench_level;    /* log_pace moves it on after each line it writes */
-          static const int vita_bench_quads_of[5] = { 0, 500, 1000, 2000, 4000 };
+          /* gpubench.txt: extra textured quads drawn over every frame -- none, 500, 1000, then 2000, a level for each
+             300-frame line of the log -- to see what the SDL GXM renderer costs a quad on this CPU.
+             1: a separate SDL_RenderCopyEx call for every quad. The first version did only this, and it cost
+                20-80 microseconds a quad: far too much for a renderer of 2000 quads a frame.
+             2: every quad in one vertex array and a single SDL_RenderGeometry call, as a real renderer would batch
+                them, so that what a quad costs is four vertices written rather than a call. */
+          static int vita_bench;
+          static int vita_bench_level;     /* log_pace moves it on after each line it writes */
+          static bool vita_bench_failed;   /* SDL_RenderGeometry refused: the batched numbers would measure nothing */
+          static const int vita_bench_quads_of[4] = { 0, 500, 1000, 2000 };
+
+          #define VITA_BENCH_MOST 2000
 
           static void vita_bench_draw(void)
           {
-          	const int count = vita_bench ? vita_bench_quads_of[vita_bench_level % 5] : 0;
+          	static SDL_Vertex vertices[VITA_BENCH_MOST * 4];
+          	static int indices[VITA_BENCH_MOST * 6];
+          	const int count = vita_bench ? vita_bench_quads_of[vita_bench_level % 4] : 0;
+          	const SDL_Color white = { 255, 255, 255, 255 };
+          	int texture_w = 1, texture_h = 1;
           	SDL_BlendMode kept;
 
           	if (count == 0)
           		return;
+          	SDL_QueryTexture(texture, NULL, NULL, &texture_w, &texture_h);
           	/* blended, as tiles and sprites with transparent pens would be. The frame's pixels carry no alpha, so
           	   the quads cost the GPU a full blend and show nothing: the picture is left as it is */
           	SDL_GetTextureBlendMode(texture, &kept);
@@ -722,9 +734,36 @@ jobs:
           		   zoomed sprites would be */
           		const SDL_Rect from = { (quad * 16) % 320, ((quad / 20) * 16) % 224, 16, 16 };
           		const SDL_Rect to = { (quad * 37) % (960 - 32), (quad * 23) % (544 - 32), 32, 32 };
+          		const bool flip = (quad & 1) != 0;
 
-          		SDL_RenderCopyEx(renderer, texture, &from, &to, 0.0, NULL, (quad & 1) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+          		if (vita_bench == 1)
+          			SDL_RenderCopyEx(renderer, texture, &from, &to, 0.0, NULL, flip ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+          		else
+          		{
+          			/* the source in the texture's 0-1 coordinates; a flip is the two sides swapped */
+          			const float u0 = (float)from.x / (float)texture_w, u1 = (float)(from.x + from.w) / (float)texture_w;
+          			const float t0 = (float)from.y / (float)texture_h, t1 = (float)(from.y + from.h) / (float)texture_h;
+          			const float left = flip ? u1 : u0, right = flip ? u0 : u1;
+          			const float x0 = (float)to.x, x1 = (float)(to.x + to.w), y0 = (float)to.y, y1 = (float)(to.y + to.h);
+          			SDL_Vertex *const corner = &vertices[quad * 4];
+          			int *const index = &indices[quad * 6];
+
+          			corner[0].position.x = x0; corner[0].position.y = y0; corner[0].tex_coord.x = left;  corner[0].tex_coord.y = t0;
+          			corner[1].position.x = x1; corner[1].position.y = y0; corner[1].tex_coord.x = right; corner[1].tex_coord.y = t0;
+          			corner[2].position.x = x1; corner[2].position.y = y1; corner[2].tex_coord.x = right; corner[2].tex_coord.y = t1;
+          			corner[3].position.x = x0; corner[3].position.y = y1; corner[3].tex_coord.x = left;  corner[3].tex_coord.y = t1;
+          			corner[0].color = corner[1].color = corner[2].color = corner[3].color = white;
+          			/* two triangles a quad */
+          			index[0] = quad * 4;
+          			index[1] = quad * 4 + 1;
+          			index[2] = quad * 4 + 2;
+          			index[3] = quad * 4;
+          			index[4] = quad * 4 + 2;
+          			index[5] = quad * 4 + 3;
+          		}
           	}
+          	if (vita_bench == 2 && SDL_RenderGeometry(renderer, texture, vertices, count * 4, indices, count * 6) != 0)
+          		vita_bench_failed = true;
           	SDL_SetTextureBlendMode(texture, kept);
           }
           #endif
