@@ -79,6 +79,12 @@ uint64_t s32_video_frame_hash(void);
 #define S32_VIDEO_WIDE_SIDE_MOST S32_VIDEO_WIDE_SIDE_20_9
 void s32_video_set_wide_side(int side);
 
+/* Half the columns: the layers and the mix work out every other column, and the one beside it shows the
+   same, so the picture has half its width's detail for about half their work. Sprites are still drawn
+   whole. Off, the default, every column is the board's own; a port on a machine that cannot keep up
+   turns it on */
+void s32_video_set_half_columns(bool on);
+
 /* This frame's: WIDE's side, else 0 */
 int s32_video_side(void);
 

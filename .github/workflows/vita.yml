@@ -499,9 +499,23 @@ jobs:
           				resample_stretch = value != 0;
           			fclose(file);
           		}
-          		s32_workers_start(workers);
-          		fprintf(stderr, "frameskip: %d, audio stretched to fill: %s\\n", vita_frame_skip,
-          			resample_stretch ? "yes" : "no");
+          		/* halfres.txt 1: the picture's layers and mix work out every other column (runtime/src/video.c,
+          		   s32_video_set_half_columns), half the detail across for about half their work. Off unless asked */
+          		{
+          			bool half_columns = false;
+
+          			file = fopen(VITA_FOLDER "/halfres.txt", "r");
+          			if (file)
+          			{
+          				if (fscanf(file, "%d", &value) == 1)
+          					half_columns = value != 0;
+          				fclose(file);
+          			}
+          			s32_video_set_half_columns(half_columns);
+          			s32_workers_start(workers);
+          			fprintf(stderr, "frameskip: %d, audio stretched to fill: %s, half columns: %s\\n", vita_frame_skip,
+          				resample_stretch ? "yes" : "no", half_columns ? "yes" : "no");
+          		}
           	}
           #else
           	s32_workers_start(VIDEO_WORKERS);

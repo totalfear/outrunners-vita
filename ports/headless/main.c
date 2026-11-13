@@ -63,7 +63,7 @@
 #define USAGE "Usage: orunners_headless [--frames N] [--hashes FILE] [--script FILE] [--dump-frame N --dump-dir DIR]" \
 	" [--video-hashes FILE] [--video-dump N ... --video-dir DIR] [--sound-hashes FILE]" \
 	" [--sprite-census FILE] [--tile-census FILE] [--memory-census FILE] [--assets FOLDER|PACK.assets]" \
-	" [--write-pack PACK.assets] [--workers N] [--screens 1|2] [--sound-wav FILE]" \
+	" [--write-pack PACK.assets] [--workers N] [--screens 1|2] [--half-columns] [--sound-wav FILE]" \
 	" (orunners_console_headless: [--actions FILE] [--wide | --wide-20-9 | --wide-16-10] [--autopilot]" \
 	" [--ghost-folder DIR] [--pause-dump N] [--side-map] [--real-time] [--name NAME] [--network-log FRAMES]" \
 	" [--restart N])\n"
@@ -516,6 +516,8 @@ int main(int argc, char **argv)
 			pack_path = argv[++index];
 		else if (strcmp(argv[index], "--workers") == 0 && index + 1 < argc)
 			s32_workers_start(atoi(argv[++index]));    /* (the video's rows on that many more threads) */
+		else if (strcmp(argv[index], "--half-columns") == 0)
+			s32_video_set_half_columns(true);    /* (every other column worked out, as a slow device's port asks) */
 		else if (strcmp(argv[index], "--screens") == 0 && index + 1 < argc)
 			screens = atoi(argv[++index]);
 #ifdef ORUNNERS_CONSOLE

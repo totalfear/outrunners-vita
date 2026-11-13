@@ -168,6 +168,7 @@ static struct
 } video;
 
 static const uint16_t transparent_row[WIDTH] = { 0 };
+static bool half_columns;    /* s32_video_set_half_columns: every other column worked out, the next its copy */
 
 /* A sprite pixel's marks (the extra palette's plane) */
 #define EXTRA_COLOURS 1    /* its colour from the extra palette, where one is set */
@@ -448,7 +449,17 @@ static void draw_row(layer *out, int y, const uint16_t *runs, bool drawn, pixel_
 
 	for (;; runs++, drawn = !drawn)
 	{
-		if (drawn)
+		if (drawn && half_columns)
+		{
+			/* the even columns worked out (and a run's first, wherever it starts), each odd one a copy of
+			   the one before it. Every layer samples the same columns, so they still line up */
+			for (int x = runs[0]; x < runs[1] && x < WIDTH; x++)
+			{
+				pixels[x] = (x == runs[0] || !(x & 1)) ? pixel(row, x & ~1) : pixels[x - 1];
+				transparent += pixels[x] == 0;
+			}
+		}
+		else if (drawn)
 		{
 			for (int x = runs[0]; x < runs[1] && x < WIDTH; x++)
 			{
@@ -701,7 +712,9 @@ static void draw_text_rows(void *context, int first, int last)
 		{
 			const int column = x - video.side;
 
-			if (video.side && (column < 0 || column >= 320))
+			if (half_columns && (x & 1) && x > video.visible.left)
+				video.layers[LAYER_TEXT].pixels[y][x] = video.layers[LAYER_TEXT].pixels[y][x - 1];
+			else if (video.side && (column < 0 || column >= 320))
 				video.layers[LAYER_TEXT].pixels[y][x] = 0;    /* (WIDE: the sides clear) */
 			else
 				video.layers[LAYER_TEXT].pixels[y][x] = flip ? text_pixel(255 - y, 511 - column) : text_pixel(y, column);
@@ -1485,6 +1498,12 @@ static void mix_rows(void *context, int first_row, int last_row)
 
 		for (int x = video.visible.left; x <= video.visible.right; x++, sprite_x += sprite_dx)
 		{
+			if (half_columns && (x & 1) && x > video.visible.left)
+			{
+				/* (half the columns: this one shows the one before it; the loop's step still moves sprite_x) */
+				video.frame[screen][y][x] = video.frame[screen][y][x - 1];
+				continue;
+			}
 			const int sprite_pixel = rows[LAYER_SPRITES][sprite_x];
 			const int group = (sprite_pixel >> grouping.shift) & grouping.mask;
 			int shadow = 0;
@@ -1680,6 +1699,11 @@ void s32_video_extra_colour(int screen, uint32_t index, uint16_t colour)
 void s32_video_set_wide_side(int side)
 {
 	video.wide_side = side < 0 ? 0 : (side > S32_VIDEO_WIDE_SIDE_MOST ? S32_VIDEO_WIDE_SIDE_MOST : side);
+}
+
+void s32_video_set_half_columns(bool on)
+{
+	half_columns = on;
 }
 
 int s32_video_side(void)
