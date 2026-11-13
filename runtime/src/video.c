@@ -169,6 +169,19 @@ static struct
 
 static const uint16_t transparent_row[WIDTH] = { 0 };
 
+/* One row of every layer, per worker thread: 8 x 496 x 2 bytes, which sits in L1 beside the row being
+   mixed. The layers are drawn and mixed a row at a time, so a row is all that has to exist at once --
+   but only when a single screen is mixed. Two screens share the layers the first one drew, and that
+   needs the full buffers, so the flag below picks between them for the frame. */
+typedef struct layer_scratch
+{
+	uint16_t pixels[LAYERS][WIDTH];
+	bool empty[LAYERS];
+} layer_scratch;
+
+static _Thread_local layer_scratch scratch;
+static bool layers_to_scratch;    /* set once a frame: one screen mixed, so the rows need not be kept */
+
 /* A sprite pixel's marks (the extra palette's plane) */
 #define EXTRA_COLOURS 1    /* its colour from the extra palette, where one is set */
 #define EXTRA_GHOST   2    /* half its colour, half the colour under it */
@@ -441,9 +454,10 @@ static bool find_clip_runs(bool enabled, bool outside, int selected, clip_runs *
 
 /* One row of a layer through its runs, which alternate between drawn and cleared starting with 'drawn'.
    Overlapping windows can make a run start before the last one ended: it is drawn again. */
-static void draw_row(layer *out, int y, const uint16_t *runs, bool drawn, pixel_source pixel, const void *row)
+static void draw_row(int index, int y, const uint16_t *runs, bool drawn, pixel_source pixel, const void *row)
 {
-	uint16_t *pixels = out->pixels[y];
+	uint16_t *const pixels = layers_to_scratch ? scratch.pixels[index] : video.layers[index].pixels[y];
+	bool *const empty = layers_to_scratch ? &scratch.empty[index] : &video.layers[index].empty[y];
 	int transparent = 0;
 
 	for (;; runs++, drawn = !drawn)
@@ -465,7 +479,7 @@ static void draw_row(layer *out, int y, const uint16_t *runs, bool drawn, pixel_
 		if (runs[1] > video.visible.right)
 			break;
 	}
-	out->empty[y] = transparent == video.visible.right + 1 - video.visible.left;
+	*empty = transparent == video.visible.right + 1 - video.visible.left;
 }
 
 /* ---- the layers ---- */
@@ -540,7 +554,7 @@ static void draw_zoomed_rows(void *context, int first, int last)
 			zoomed->x_start, zoomed->x_step
 		};
 
-		draw_row(&video.layers[LAYER_NBG0 + zoomed->number], y, zoomed->runs.lists[zoomed->runs.list_of_row[y]],
+		draw_row(LAYER_NBG0 + zoomed->number, y, zoomed->runs.lists[zoomed->runs.list_of_row[y]],
 			zoomed->first_drawn, zoomed_pixel, &row);
 	}
 }
@@ -663,7 +677,7 @@ static void draw_scrolled_rows(void *context, int first, int last)
 		row.pages[1] = scrolled->pages[((source_y >> 7) & 2) + 1];
 		row.bank = scrolled->bank;
 		row.line = source_y & 0xff;
-		draw_row(&video.layers[LAYER_NBG0 + scrolled->number], y, scrolled->runs.lists[scrolled->runs.list_of_row[y]],
+		draw_row(LAYER_NBG0 + scrolled->number, y, scrolled->runs.lists[scrolled->runs.list_of_row[y]],
 			scrolled->first_drawn, scrolled_pixel, &row);
 	}
 }
@@ -697,15 +711,23 @@ static void draw_text_rows(void *context, int first, int last)
 	const bool flip = *(const bool *)context;
 
 	for (int y = first; y <= last; y++)
+	{
+		uint16_t *const pixels = layers_to_scratch ? scratch.pixels[LAYER_TEXT]
+			: video.layers[LAYER_TEXT].pixels[y];
+
+		/* (it fills every column, so it is never the empty row; draw_row's count does not run here) */
+		if (layers_to_scratch)
+			scratch.empty[LAYER_TEXT] = false;
 		for (int x = video.visible.left; x <= video.visible.right; x++)
 		{
 			const int column = x - video.side;
 
 			if (video.side && (column < 0 || column >= 320))
-				video.layers[LAYER_TEXT].pixels[y][x] = 0;    /* (WIDE: the sides clear) */
+				pixels[x] = 0;    /* (WIDE: the sides clear) */
 			else
-				video.layers[LAYER_TEXT].pixels[y][x] = flip ? text_pixel(255 - y, 511 - column) : text_pixel(y, column);
+				pixels[x] = flip ? text_pixel(255 - y, 511 - column) : text_pixel(y, column);
 		}
+	}
 }
 
 static bool text_flip_kept;
@@ -761,7 +783,7 @@ static void draw_bitmap_rows(void *context, int first, int last)
 			bitmap->x_scroll, bitmap->color, bitmap->bits8
 		};
 
-		draw_row(&video.layers[LAYER_BITMAP], y, bitmap->runs.lists[bitmap->runs.list_of_row[y]], bitmap->first_drawn,
+		draw_row(LAYER_BITMAP, y, bitmap->runs.lists[bitmap->runs.list_of_row[y]], bitmap->first_drawn,
 			bitmap_pixel, &row);
 	}
 }
@@ -782,6 +804,25 @@ static void draw_bitmap(void)
 }
 
 /* The backdrop: one color for the screen, or one per line (register 0x5E bit 15), wrapping at 511 */
+static void draw_backdrop_rows(void *context, int first, int last)
+{
+	const uint16_t control = video_register(0x5e);
+	const bool flip = bit(video_register(0x00), 9);
+
+	(void)context;
+	for (int y = first; y <= last; y++)
+	{
+		/* the row this one shows: flipped, it is the colour the far row would have had */
+		const int source = flip ? video.visible.bottom - y : y;
+		const int color = (control & 0x1e00) + (bit(control, 15) ? (control + source) & 0x1ff : 0);
+		uint16_t *const row = layers_to_scratch ? scratch.pixels[LAYER_BACKDROP]
+			: video.layers[LAYER_BACKDROP].pixels[y];
+
+		for (int x = video.visible.left; x <= video.visible.right; x++)
+			row[x] = (uint16_t)color;
+	}
+}
+
 static void draw_backdrop(void)
 {
 	const uint16_t control = video_register(0x5e);
@@ -870,7 +911,7 @@ static int draw_layers(int wanted)
 		draw_bitmap();
 		drawn |= 1 << LAYER_BITMAP;
 	}
-	draw_backdrop();
+	pipeline_add(draw_backdrop_rows, NULL);    /* (last of the layers, before the mix) */
 	return drawn;
 }
 
@@ -1479,9 +1520,12 @@ static void mix_rows(void *context, int first_row, int last_row)
 		const int sprite_dx = bit(sprite_flips, 0) ? -1 : 1;
 
 		for (int index = LAYER_TEXT; index <= LAYER_BITMAP; index++)
-			rows[index] = video.layers[index].empty[y] ? transparent_row : video.layers[index].pixels[y];
+			rows[index] = (layers_to_scratch ? scratch.empty[index] : video.layers[index].empty[y])
+				? transparent_row
+				: (layers_to_scratch ? scratch.pixels[index] : video.layers[index].pixels[y]);
 		rows[LAYER_SPRITES] = video.sprites[screen][video.shown_sprites][sprite_y];
-		rows[LAYER_BACKDROP] = video.layers[LAYER_BACKDROP].pixels[y];
+		rows[LAYER_BACKDROP] = layers_to_scratch ? scratch.pixels[LAYER_BACKDROP]
+			: video.layers[LAYER_BACKDROP].pixels[y];
 
 		for (int x = video.visible.left; x <= video.visible.right; x++, sprite_x += sprite_dx)
 		{
@@ -1566,6 +1610,12 @@ void s32_video_draw_frame(void)
 	   its last frame */
 	int wanted = 0;
 	int drawn = -1;
+	int mixed = 0;
+
+	/* the screens that will be mixed: with one, a layer's row need not outlive the row it is mixed into */
+	for (int screen = 0; screen < S32_SCREENS; screen++)
+		mixed += bit((uint32_t)video.screens_shown, screen) && s32_display_enabled(screen) ? 1 : 0;
+	layers_to_scratch = mixed <= 1;
 
 	for (int screen = 0; screen < S32_SCREENS; screen++)
 		if (bit((uint32_t)video.screens_shown, screen) && s32_display_enabled(screen))
