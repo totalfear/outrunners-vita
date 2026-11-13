@@ -499,9 +499,16 @@ jobs:
           				resample_stretch = value != 0;
           			fclose(file);
           		}
+          		file = fopen(VITA_FOLDER "/gpubench.txt", "r");
+          		if (file)
+          		{
+          			if (fscanf(file, "%d", &value) == 1)
+          				vita_bench = value != 0;
+          			fclose(file);
+          		}
           		s32_workers_start(workers);
-          		fprintf(stderr, "frameskip: %d, audio stretched to fill: %s\\n", vita_frame_skip,
-          			resample_stretch ? "yes" : "no");
+          		fprintf(stderr, "frameskip: %d, audio stretched to fill: %s, gpu bench: %s\\n", vita_frame_skip,
+          			resample_stretch ? "yes" : "no", vita_bench ? "on" : "off");
           	}
           #else
           	s32_workers_start(VIDEO_WORKERS);
@@ -625,6 +632,12 @@ jobs:
           			s32_sound_program_us = 0;
           			s32_sound_program_calls = 0;
           		}
+          		if (vita_bench)
+          		{
+          			/* (gpubench.txt: the extra quads every frame of this line drew; then on to the next level) */
+          			fprintf(stderr, "  gpu bench: %d extra quads a frame\\n", vita_bench_quads_of[vita_bench_level % 5]);
+          			vita_bench_level++;
+          		}
           		fprintf(stderr, "  the board's sprites %.1f ms, the game's own code %.1f\\n",
           			(double)pace_sprites * per_frame,
           			((double)pace_work - (double)pace_video - (double)pace_showing - (double)pace_controls
@@ -679,6 +692,55 @@ jobs:
           #ifdef __vita__
           	time_the_sprites();
           #endif""")
+
+
+          edit("gpu bench", 'vita_bench_draw(void)',
+          '''/* The pixels the window shows: the console's OPTIONS > VIDEO; the arcade's F3, sharp or smooth */
+          ''','''#ifdef __vita__
+          /* gpubench.txt (1): extra textured quads drawn over every frame -- none, 500, 1000, 2000, then 4000, a
+             level for each line of the log -- to see what the SDL GXM renderer costs a quad on this CPU. A renderer
+             that draws the picture as quads on the GPU stands or falls on that number: a full frame is 1500-2500
+             quads, and submitting them is CPU work on the same cores the software renderer uses today. */
+          static bool vita_bench;
+          static int vita_bench_level;    /* log_pace moves it on after each line it writes */
+          static const int vita_bench_quads_of[5] = { 0, 500, 1000, 2000, 4000 };
+
+          static void vita_bench_draw(void)
+          {
+          	const int count = vita_bench ? vita_bench_quads_of[vita_bench_level % 5] : 0;
+          	SDL_BlendMode kept;
+
+          	if (count == 0)
+          		return;
+          	/* blended, as tiles and sprites with transparent pens would be. The frame's pixels carry no alpha, so
+          	   the quads cost the GPU a full blend and show nothing: the picture is left as it is */
+          	SDL_GetTextureBlendMode(texture, &kept);
+          	SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+          	for (int quad = 0; quad < count; quad++)
+          	{
+          		/* 16 x 16 pieces of the frame drawn at 32 x 32, scattered and every other one flipped, as tiles and
+          		   zoomed sprites would be */
+          		const SDL_Rect from = { (quad * 16) % 320, ((quad / 20) * 16) % 224, 16, 16 };
+          		const SDL_Rect to = { (quad * 37) % (960 - 32), (quad * 23) % (544 - 32), 32, 32 };
+
+          		SDL_RenderCopyEx(renderer, texture, &from, &to, 0.0, NULL, (quad & 1) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+          	}
+          	SDL_SetTextureBlendMode(texture, kept);
+          }
+          #endif
+
+          /* The pixels the window shows: the console's OPTIONS > VIDEO; the arcade's F3, sharp or smooth */
+          ''')
+
+          edit("gpu bench call", 'vita_bench_draw();',
+          '''	if (!frame_behind())
+          		SDL_RenderPresent(renderer);
+          }''','''#ifdef __vita__
+          	vita_bench_draw();    /* (gpubench.txt: extra quads, for the GPU renderer question; flushed by the present below) */
+          #endif
+          	if (!frame_behind())
+          		SDL_RenderPresent(renderer);
+          }''')
 
 
           problems = []
