@@ -78,6 +78,38 @@ typedef struct clip_runs
 	uint16_t lists[256][16];
 } clip_runs;
 
+/* The layers and the mix are one pass over the rows: each draw_ function works its setup out and adds
+   its row function here, and s32_video_draw_frame runs them all over each row in turn. A layer's pixels
+   are then still in cache when the mix reads them, instead of making a 1.27 MB round trip through
+   memory, and the workers meet at one barrier instead of seven. */
+#define PIPELINE_MOST 8
+
+static struct
+{
+	int count;
+	s32_rows_work work[PIPELINE_MOST];
+	void *context[PIPELINE_MOST];
+} pipeline;
+
+static void pipeline_add(s32_rows_work work, void *context)
+{
+	if (pipeline.count < PIPELINE_MOST)
+	{
+		pipeline.work[pipeline.count] = work;
+		pipeline.context[pipeline.count] = context;
+		pipeline.count++;
+	}
+}
+
+/* One row through every step, in the order they were added: the layers, then the mix */
+static void draw_and_mix_rows(void *context, int first, int last)
+{
+	(void)context;
+	for (int y = first; y <= last; y++)
+		for (int step = 0; step < pipeline.count; step++)
+			pipeline.work[step](pipeline.context[step], y, y);
+}
+
 /* The source of one row of a layer: its pixel at a screen column */
 typedef uint16_t (*pixel_source)(const void *row, int x);
 
@@ -492,6 +524,7 @@ typedef struct zoomed_layer
 	uint32_t x_step;
 	uint32_t source_y;  /* at the top row, 12.20 */
 	uint32_t y_step;
+	clip_runs runs;    /* its own: the layers are set up together now, so they cannot share one */
 } zoomed_layer;
 
 static void draw_zoomed_rows(void *context, int first, int last)
@@ -507,10 +540,12 @@ static void draw_zoomed_rows(void *context, int first, int last)
 			zoomed->x_start, zoomed->x_step
 		};
 
-		draw_row(&video.layers[LAYER_NBG0 + zoomed->number], y, video.runs.lists[video.runs.list_of_row[y]],
+		draw_row(&video.layers[LAYER_NBG0 + zoomed->number], y, zoomed->runs.lists[zoomed->runs.list_of_row[y]],
 			zoomed->first_drawn, zoomed_pixel, &row);
 	}
 }
+
+static zoomed_layer zoomed_kept[2];    /* the context outlives the setup now: the dispatch is later */
 
 /* NBG0 and NBG1: scrolled (with a fraction) and zoomed about a center. The steps are screen pixels per
    source pixel (0x200 = 1); the source moves by their reciprocal, in 12.20. */
@@ -528,8 +563,9 @@ static void draw_zoomed(int number)
 	uint32_t y_step;
 	uint32_t x_start;
 	uint32_t source_y;
+	zoomed_layer *const zoomed = &zoomed_kept[number];
 	const bool first_drawn = find_clip_runs(bit(video_register(0x02), 11 + number), bit(video_register(0x02), 6 + number),
-		(video_register(0x06) >> (4 * number)) & 0x0f, &video.runs);
+		(video_register(0x06) >> (4 * number)) & 0x0f, &zoomed->runs);
 
 	flips_of(number, &flip_x, &flip_y);
 	if (x_zoom < 0x80)
@@ -559,13 +595,18 @@ static void draw_zoomed(int number)
 		x_step = 0u - x_step;
 	}
 
-	{
-		const zoomed_layer zoomed = {
-			number, { pages[0], pages[1], pages[2], pages[3] }, bank, first_drawn, x_start, x_step, source_y, y_step
-		};
-
-		s32_workers_rows(draw_zoomed_rows, (void *)&zoomed, video.visible.top, video.visible.bottom);
-	}
+	zoomed->number = number;
+	zoomed->pages[0] = pages[0];
+	zoomed->pages[1] = pages[1];
+	zoomed->pages[2] = pages[2];
+	zoomed->pages[3] = pages[3];
+	zoomed->bank = bank;
+	zoomed->first_drawn = first_drawn;
+	zoomed->x_start = x_start;
+	zoomed->x_step = x_step;
+	zoomed->source_y = source_y;
+	zoomed->y_step = y_step;
+	pipeline_add(draw_zoomed_rows, zoomed);
 }
 
 typedef struct scrolled_row
@@ -599,6 +640,7 @@ typedef struct scrolled_layer
 	bool flip_x;
 	bool flip_y;
 	bool first_drawn;
+	clip_runs runs;    /* its own: the layers are set up together now, so they cannot share one */
 } scrolled_layer;
 
 static void draw_scrolled_rows(void *context, int first, int last)
@@ -621,30 +663,32 @@ static void draw_scrolled_rows(void *context, int first, int last)
 		row.pages[1] = scrolled->pages[((source_y >> 7) & 2) + 1];
 		row.bank = scrolled->bank;
 		row.line = source_y & 0xff;
-		draw_row(&video.layers[LAYER_NBG0 + scrolled->number], y, video.runs.lists[video.runs.list_of_row[y]],
+		draw_row(&video.layers[LAYER_NBG0 + scrolled->number], y, scrolled->runs.lists[scrolled->runs.list_of_row[y]],
 			scrolled->first_drawn, scrolled_pixel, &row);
 	}
 }
 
 /* NBG2 and NBG3: scrolled, and row by row the line table can add to the column (row scroll) or pick
    the source row (row select). Register 0x04 turns those on; its top bits place the table. */
+static scrolled_layer scrolled_kept[2];    /* NBG2 and NBG3, kept until the single dispatch */
+
 static void draw_scrolled(int number)
 {
 	const uint16_t line_control = video_register(0x04);
 	const bool line_windows = bit(line_control, number + 2);
-	scrolled_layer scrolled;
+	scrolled_layer *const scrolled = &scrolled_kept[number - 2];
 
-	scrolled.number = number;
-	scrolled.table = (uint32_t)(line_control >> 10) * 0x400 + 0x100 * (uint32_t)(number - 2);
-	scrolled.row_scroll = bit(line_control, number - 2) && !line_windows;
-	scrolled.row_select = bit(line_control, number) && !line_windows;
-	scrolled.x_scroll = (video_register(0x12 + 8 * (uint32_t)number) & 0x3ff) - (video_register(0x30 + 4 * (uint32_t)number) & 0x1ff);
-	scrolled.y_scroll = video_register(0x16 + 8 * (uint32_t)number) & 0x1ff;
-	scrolled.bank = pages_of(number, scrolled.pages);
-	scrolled.first_drawn = find_clip_runs(bit(video_register(0x02), 11 + number), bit(video_register(0x02), 6 + number),
-		(video_register(0x06) >> (4 * number)) & 0x0f, &video.runs);
-	flips_of(number, &scrolled.flip_x, &scrolled.flip_y);
-	s32_workers_rows(draw_scrolled_rows, &scrolled, video.visible.top, video.visible.bottom);
+	scrolled->number = number;
+	scrolled->table = (uint32_t)(line_control >> 10) * 0x400 + 0x100 * (uint32_t)(number - 2);
+	scrolled->row_scroll = bit(line_control, number - 2) && !line_windows;
+	scrolled->row_select = bit(line_control, number) && !line_windows;
+	scrolled->x_scroll = (video_register(0x12 + 8 * (uint32_t)number) & 0x3ff) - (video_register(0x30 + 4 * (uint32_t)number) & 0x1ff);
+	scrolled->y_scroll = video_register(0x16 + 8 * (uint32_t)number) & 0x1ff;
+	scrolled->bank = pages_of(number, scrolled->pages);
+	scrolled->first_drawn = find_clip_runs(bit(video_register(0x02), 11 + number), bit(video_register(0x02), 6 + number),
+		(video_register(0x06) >> (4 * number)) & 0x0f, &scrolled->runs);
+	flips_of(number, &scrolled->flip_x, &scrolled->flip_y);
+	pipeline_add(draw_scrolled_rows, scrolled);
 }
 
 /* The text layer, with no scroll and no windows; the screen's flip turns the whole 512 x 256 map */
@@ -664,11 +708,12 @@ static void draw_text_rows(void *context, int first, int last)
 		}
 }
 
+static bool text_flip_kept;
+
 static void draw_text(void)
 {
-	bool flip = bit(video_register(0x00), 9);
-
-	s32_workers_rows(draw_text_rows, &flip, video.visible.top, video.visible.bottom);
+	text_flip_kept = bit(video_register(0x00), 9);
+	pipeline_add(draw_text_rows, &text_flip_kept);
 }
 
 typedef struct bitmap_row
@@ -702,6 +747,7 @@ typedef struct bitmap_layer
 	int y_scroll;
 	int color;
 	bool first_drawn;
+	clip_runs runs;    /* its own: the layers are set up together now, so they cannot share one */
 } bitmap_layer;
 
 static void draw_bitmap_rows(void *context, int first, int last)
@@ -715,7 +761,7 @@ static void draw_bitmap_rows(void *context, int first, int last)
 			bitmap->x_scroll, bitmap->color, bitmap->bits8
 		};
 
-		draw_row(&video.layers[LAYER_BITMAP], y, video.runs.lists[video.runs.list_of_row[y]], bitmap->first_drawn,
+		draw_row(&video.layers[LAYER_BITMAP], y, bitmap->runs.lists[bitmap->runs.list_of_row[y]], bitmap->first_drawn,
 			bitmap_pixel, &row);
 	}
 }
@@ -724,14 +770,15 @@ static void draw_bitmap_rows(void *context, int first, int last)
    bit 11), scrolled by registers 0x88 and 0x8A, its palette from 0x8C; window 4 clips it */
 static void draw_bitmap(void)
 {
-	bitmap_layer bitmap;
+	static bitmap_layer bitmap_kept;
+	bitmap_layer *const bitmap = &bitmap_kept;
 
-	bitmap.bits8 = bit(video_register(0x00), 11);
-	bitmap.x_scroll = video_register(0x88) & 0x1ff;
-	bitmap.y_scroll = video_register(0x8a) & 0x1ff;
-	bitmap.color = (video_register(0x8c) << 4) & 0x1fff0 & ~((1 << (bitmap.bits8 ? 8 : 4)) - 1);
-	bitmap.first_drawn = find_clip_runs(bit(video_register(0x02), 15), bit(video_register(0x02), 10), 0x10, &video.runs);
-	s32_workers_rows(draw_bitmap_rows, &bitmap, video.visible.top, video.visible.bottom);
+	bitmap->bits8 = bit(video_register(0x00), 11);
+	bitmap->x_scroll = video_register(0x88) & 0x1ff;
+	bitmap->y_scroll = video_register(0x8a) & 0x1ff;
+	bitmap->color = (video_register(0x8c) << 4) & 0x1fff0 & ~((1 << (bitmap->bits8 ? 8 : 4)) - 1);
+	bitmap->first_drawn = find_clip_runs(bit(video_register(0x02), 15), bit(video_register(0x02), 10), 0x10, &bitmap->runs);
+	pipeline_add(draw_bitmap_rows, bitmap);
 }
 
 /* The backdrop: one color for the screen, or one per line (register 0x5E bit 15), wrapping at 511 */
@@ -1407,7 +1454,7 @@ static void mix(int screen, int drawn)
 	setup.sprite_bits = sprite_bits;
 	setup.shadow_pen = shadow_pen;
 	setup.sprite_flips = sprite_flips;
-	s32_workers_rows(mix_rows, &setup, video.visible.top, video.visible.bottom);
+	pipeline_add(mix_rows, &setup);
 }
 
 static void mix_rows(void *context, int first_row, int last_row)
@@ -1535,9 +1582,13 @@ void s32_video_draw_frame(void)
 				memset(video.frame[screen][y], 0, (size_t)width * sizeof(video.frame[screen][y][0]));
 			continue;
 		}
+		pipeline.count = 0;
 		if (drawn < 0)
-			drawn = draw_layers(wanted);
-		mix(screen, drawn);
+			drawn = draw_layers(wanted);    /* (each layer adds its row function; the backdrop is drawn here) */
+		mix(screen, drawn);                 /* (and the mix adds its own, after them) */
+		/* The second screen shares the layers, so draw_layers is not called again: its pipeline holds the
+		   mix alone, and it reads the pixels the first screen's pass left in the buffers. */
+		s32_workers_rows(draw_and_mix_rows, NULL, video.visible.top, video.visible.bottom);
 	}
 }
 
