@@ -311,12 +311,16 @@ jobs:
           	while ((size_t)(phase >> 16) < frames && made < room)
           	{
           		const size_t index = phase >> 16;
-          		const int32_t between = (int32_t)(phase & 0xffff);
+          		const int64_t between = (int64_t)(phase & 0xffff);
           		const int16_t *before = index == 0 ? resample_last : &samples[(index - 1) * 2];
           		const int16_t *after = &samples[index * 2];
 
-          		out[made * 2] = (int16_t)(before[0] + (((int32_t)after[0] - before[0]) * between >> 16));
-          		out[made * 2 + 1] = (int16_t)(before[1] + (((int32_t)after[1] - before[1]) * between >> 16));
+          		/* 64-bit on purpose: the gap between two samples reaches 65535 and 'between' reaches
+          		   65535 too, and 65535 * 65535 is past what a signed 32-bit int holds. In 32 bits this
+          		   overflowed on any pair swinging more than half of full scale -- which loud FM does
+          		   constantly -- and every one of those came out as a click. */
+          		out[made * 2] = (int16_t)(before[0] + (int32_t)((((int64_t)after[0] - before[0]) * between) >> 16));
+          		out[made * 2 + 1] = (int16_t)(before[1] + (int32_t)((((int64_t)after[1] - before[1]) * between) >> 16));
           		made++;
           		phase += step;
           	}
