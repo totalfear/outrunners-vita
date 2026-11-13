@@ -292,13 +292,46 @@ jobs:
           static int16_t resample_last[2];     /* the last sample of the frame before */
           static bool resample_going;          /* resample_last holds one */
 
+          /* The game runs below 60 a second, so it makes less than a second of mix in a second and the
+             device runs dry: that is the chopping. Rather than let it gap, the mix is stretched to fill the
+             time, by nudging the resampler's step to keep a few frames of sound in the queue. It comes out
+             low -- which is what slow motion should sound like -- but it is continuous, and the pitch
+             follows the frame rate back up as the frame rate improves. stretch.txt 0 turns it off. */
+          static bool resample_stretch = true;
+          static uint32_t resample_step;       /* 16.16, nudged each frame; 0 until the first one */
+
           static void queue_resampled(const int16_t *samples, size_t frames)
           {
-          	static int16_t out[4096];        /* (a frame of the mix is about 926 samples, which make about 800) */
+          	/* a frame of the mix is about 926 samples, which make about 800 at the board's own pitch -- but
+          	   stretched to the limit below they make about 2400, so there is room for three times that */
+          	static int16_t out[8192];
           	const size_t room = sizeof(out) / sizeof(out[0]) / 2;
-          	const uint32_t step = (uint32_t)(((uint64_t)sound_chips_mix_rate() << 16) / RESAMPLE_RATE);
+          	const uint32_t base = (uint32_t)(((uint64_t)sound_chips_mix_rate() << 16) / RESAMPLE_RATE);
+          	const Uint32 frame_bytes = RESAMPLE_RATE / 60 * 2 * (Uint32)sizeof(int16_t);
+          	uint32_t step;
           	uint32_t phase = resample_phase;
           	size_t made = 0;
+
+          	if (resample_step == 0)
+          		resample_step = base;
+          	if (resample_stretch)
+          	{
+          		/* a smaller step means more samples out of the same mix: the sound stretches and drops in
+          		   pitch. A 1/256 nudge a frame moves about 0.4% at a time, slow enough not to warble */
+          		const Uint32 queued = SDL_GetQueuedAudioSize(audio);
+
+          		if (queued < frame_bytes * 3u)
+          			resample_step -= resample_step / 256u;
+          		else if (queued > frame_bytes * 6u)
+          			resample_step += resample_step / 256u;
+          		if (resample_step < base / 3u)
+          			resample_step = base / 3u;    /* (three times slower at the very most) */
+          		if (resample_step > base)
+          			resample_step = base;         /* (never faster than the board's own pitch) */
+          	}
+          	else
+          		resample_step = base;
+          	step = resample_step;
 
           	if (frames == 0)
           		return;
@@ -459,8 +492,16 @@ jobs:
           				vita_frame_skip = value;
           			fclose(file);
           		}
+          		file = fopen(VITA_FOLDER "/stretch.txt", "r");
+          		if (file)
+          		{
+          			if (fscanf(file, "%d", &value) == 1)
+          				resample_stretch = value != 0;
+          			fclose(file);
+          		}
           		s32_workers_start(workers);
-          		fprintf(stderr, "frameskip: %d\\n", vita_frame_skip);
+          		fprintf(stderr, "frameskip: %d, audio stretched to fill: %s\\n", vita_frame_skip,
+          			resample_stretch ? "yes" : "no");
           	}
           #else
           	s32_workers_start(VIDEO_WORKERS);
