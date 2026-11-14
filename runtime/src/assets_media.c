@@ -233,6 +233,21 @@ static uint32_t sprite_word(uint32_t place)
 	return block < sprite_block_count ? sprite_blocks[block].words[place - sprite_blocks[block].first] : 0xffffffffu;
 }
 
+/* The words from 'place' to the end of its block, for the video to read a sprite's rows in without a call
+   (and a look for the block) for every word */
+static const uint32_t *sprite_words(uint32_t place, uint32_t *count)
+{
+	const size_t block = block_of(place);
+
+	if (block >= sprite_block_count)
+	{
+		*count = 0;
+		return NULL;
+	}
+	*count = sprite_blocks[block].count - (place - sprite_blocks[block].first);
+	return &sprite_blocks[block].words[place - sprite_blocks[block].first];
+}
+
 /* The pieces of the sheet 'name' (its JSON) added to 'pieces' */
 static int sheet_pieces(const char *folder, const char *name, int sheet, sprite_piece **pieces, size_t *count,
 	size_t *room)
@@ -819,5 +834,6 @@ const s32_graphics *assets_graphics(void)
 	graphics.tile_count = TILE_COUNT;
 	graphics.sprite_word = sprite_word;
 	graphics.sprite_banks = 4;
+	graphics.sprite_words = sprite_words;
 	return &graphics;
 }

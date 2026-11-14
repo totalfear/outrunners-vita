@@ -33,13 +33,17 @@ extern "C" {
 
 /* The board's graphics as the video draws them: every tile's pens by its number (16 rows of 16, a byte a pen)
    and the 32-bit word of sprite graphics at a place of the sprite chips (bank << 20 | offset, in words): the
-   game's assets give them (game/assets.h: its tilesets and sprite sheets) */
+   game's assets give them (game/assets.h: its tilesets and sprite sheets). sprite_words, for whoever keeps
+   the words in memory in the host's order, hands back the ones from a place on that are together there and
+   how many they are (none: NULL and 0): a sprite's rows are then read without a call a word. NULL, the
+   video asks sprite_word for each */
 typedef struct
 {
 	const uint8_t *const *tile_pens;
 	uint32_t tile_count;
 	uint32_t (*sprite_word)(uint32_t place);
 	uint32_t sprite_banks;                  /* of 1M words */
+	const uint32_t *(*sprite_words)(uint32_t place, uint32_t *count);
 } s32_graphics;
 
 /* Hooks the video to s32_board, drawing with 'graphics' (kept by the caller) */

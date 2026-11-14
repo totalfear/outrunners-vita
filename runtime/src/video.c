@@ -140,7 +140,15 @@ typedef struct sprite_drawing
 	int color;
 	int transparent_bits;       /* an indirect color with all these bits set is transparent */
 	uint16_t table[16];
+	/* (draw_sprite_words': the rows read from words that are together in memory) */
+	uint32_t x_zoom;
+	bool ends;                  /* a word that ends in all ones ends the row */
+	bool zeros_clear;           /* pen 0 draws nothing wherever it is in a word: a word of zeros draws nothing */
+	int32_t *pixels;            /* what each pen puts in the buffer, a table for each place in a word, 8 of
+	                               16 pens or 4 of 256 (sprite_pens): -1, nothing. The band's (sprite_tables) */
 } sprite_drawing;
+
+#define SPRITE_PIXELS (4 * 256)    /* the most a sprite's tables hold: 4 places of 256 pens */
 
 static struct
 {
@@ -163,6 +171,11 @@ static struct
 	uint16_t sprites[S32_SCREENS][2][HEIGHT][WIDTH];    /* each screen's frame buffers: one is shown, the
 	                                                       list draws into the other */
 	int shown_sprites;
+	uint16_t sprites_left[S32_SCREENS][2][HEIGHT];    /* the columns of each row of the buffers that were drawn */
+	uint16_t sprites_right[S32_SCREENS][2][HEIGHT];   /* on since it was erased, to one past the last: the */
+	                                                  /* rest is erased still (erase_sprite_rows) */
+	bool sprites_marked[S32_SCREENS][2][HEIGHT];      /* the rows whose marks are not all 0 (draw_sprite) */
+	uint32_t sprite_work[HEIGHT];           /* the columns the last list drew on each row (draw_sprites) */
 	uint32_t frame[S32_SCREENS][HEIGHT][WIDTH];
 	clip_runs runs;
 } video;
@@ -969,10 +982,178 @@ static void draw_sprite_row(const sprite_drawing *sprite, bool from_ram, uint32_
 	}
 }
 
+/* (the loops below are worth a copy for each way they are called: with the marks or without, left or right) */
+#if defined(__GNUC__)
+#define INLINED static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define INLINED static __forceinline
+#else
+#define INLINED static inline
+#endif
+
+/* What each pen of a sprite puts in the buffer, as put_sprite_pixel works it out for one that is no shadow:
+   a table for each place a pen has in a word, the first's and the last's (where the end code is skipped)
+   and one like the other for each in the middle. Worked out once a sprite, a pixel is then a look in a
+   table and not put_sprite_pixel's tests */
+static void sprite_pens(sprite_drawing *sprite, int end_pen)
+{
+	const int pens = sprite->bits8 ? 256 : 16;
+	const int places = sprite->bits8 ? 4 : 8;
+	const int transparent_bits = sprite->transparent_bits;
+	int32_t *ends = sprite->pixels;
+	int32_t *middle = sprite->pixels + pens;
+
+	/* each pen's color, 16 pens with the same bits over them at a time (8 bits a pen: 16 times that) */
+	for (int first = 0; first < pens; first += 16)
+		if (!sprite->indirect)
+			for (int pen = first; pen < first + 16; pen++)
+				middle[pen] = sprite->color | pen;
+		else
+			for (int pen = first; pen < first + 16; pen++)
+			{
+				const int pixel = sprite->bits8 ? sprite->table[pen >> 4] | (pen & 0x0f) : sprite->table[pen];
+
+				middle[pen] = (pixel & transparent_bits) == transparent_bits ? -1 : pixel;
+			}
+	memcpy(ends, middle, (size_t)pens * sizeof(middle[0]));
+	/* and the pens skipped before their color is looked at: 0 between a word's ends, the end code at them,
+	   and 0 anywhere without a table */
+	middle[0] = -1;
+	ends[end_pen] = -1;
+	if (!sprite->indirect)
+		ends[0] = -1;
+	for (int place = 2; place < places - 1; place++)
+		memcpy(sprite->pixels + place * pens, middle, (size_t)pens * sizeof(middle[0]));
+	memcpy(sprite->pixels + (places - 1) * pens, ends, (size_t)pens * sizeof(ends[0]));
+	sprite->zeros_clear = ends[0] < 0;
+}
+
+INLINED void put_pen(uint16_t *row, uint8_t *marks, int x, int32_t pixel, uint8_t mark, const bool marked)
+{
+	if (pixel >= 0)
+	{
+		row[x] = (uint16_t)pixel;
+		if (marked)
+			marks[x] = mark;
+	}
+}
+
+/* One row of a sprite from its words together in memory, in the host's order: the pixels draw_sprite_row
+   puts, for a sprite that is no shadow, on a row the clip to leave alone does not cross. Of the sprite's
+   columns (the first at 'x', the next 'step' from it: -1 flipped) it draws 'first' to 'end' - 1, the ones
+   the clip shows: column n takes pen (n * zoom) >> 16 of the row, so the ones before are stepped over in
+   one go and not walked, and the pens the zoom skips are not looked at. Where the row ends is found first:
+   at the first of its words that ends in all ones, whether or not any of its pens is drawn. With no zoom
+   a whole word is 8 (or 4) pixels in a row, and a word of pen 0 mostly nothing at all. */
+INLINED void draw_sprite_words(const sprite_drawing *sprite, const uint32_t *words, uint16_t *row, uint8_t *marks,
+	int x, const int step, int first, int end, const bool bits8, const bool marked)
+{
+	const uint32_t zoom = sprite->x_zoom;
+	const int word_shift = bits8 ? 16 + 2 : 16 + 3;    /* a word's pens, as 'at' counts them */
+	const int place_shift = bits8 ? 16 - 3 : 16 - 2;   /* 'at' to where a pen's bits are in its word */
+	const uint32_t places = bits8 ? 24 : 28;           /* (0, 4 to 28 from the top; 8 bits a pen 0, 8, 16, 24) */
+	const int table_shift = bits8 ? 5 : 2;             /* and from there to the place's table in 'pixels' */
+	const uint32_t pen_mask = bits8 ? 0xff : 0x0f;
+	const int32_t *const pixels = sprite->pixels;
+	const int32_t *const middle = pixels + (bits8 ? 256 : 16);
+	const bool zeros_clear = sprite->zeros_clear;
+	const uint8_t mark = sprite->extra;
+	uint32_t stop = (uint32_t)end * zoom;
+	uint32_t at = (uint32_t)first * zoom;              /* the column's place in the row's pens, 16.16 */
+
+	if (sprite->ends)
+	{
+		/* (in the words before the last column's: an end in that one stops nothing that shows) */
+		const uint32_t last = (stop - zoom) >> word_shift;
+
+		for (uint32_t number = 0; number < last; number++)
+			if ((words[number] & pen_mask) == pen_mask)
+			{
+				stop = (number + 1) << word_shift;
+				break;
+			}
+	}
+	x += first * step;
+	while (at < stop)
+	{
+		const uint32_t number = at >> word_shift;
+		const uint32_t word = words[number];
+		const uint32_t word_end = (number + 1) << word_shift;
+		const uint32_t limit = word_end < stop ? word_end : stop;
+
+		if (zoom == 0x10000 && at == number << word_shift && limit == word_end)
+		{
+			/* a pen a pixel, and the whole word shows */
+			if (word != 0 || !zeros_clear)
+			{
+				if (!bits8)
+				{
+					put_pen(row, marks, x, pixels[word >> 28], mark, marked);
+					put_pen(row, marks, x + step, middle[(word >> 24) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 2 * step, middle[(word >> 20) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 3 * step, middle[(word >> 16) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 4 * step, middle[(word >> 12) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 5 * step, middle[(word >> 8) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 6 * step, middle[(word >> 4) & 0x0f], mark, marked);
+					put_pen(row, marks, x + 7 * step, pixels[word & 0x0f], mark, marked);
+				}
+				else
+				{
+					put_pen(row, marks, x, pixels[word >> 24], mark, marked);
+					put_pen(row, marks, x + step, middle[(word >> 16) & 0xff], mark, marked);
+					put_pen(row, marks, x + 2 * step, middle[(word >> 8) & 0xff], mark, marked);
+					put_pen(row, marks, x + 3 * step, pixels[word & 0xff], mark, marked);
+				}
+			}
+			x += step * (bits8 ? 4 : 8);
+			at = word_end;
+		}
+		else if (word == 0 && zeros_clear)
+			do
+			{
+				x += step;
+				at += zoom;
+			}
+			while (at < limit);
+		else
+			do
+			{
+				const uint32_t place = (at >> place_shift) & places;
+
+				put_pen(row, marks, x, pixels[place << table_shift | (word << place) >> places], mark, marked);
+				x += step;
+				at += zoom;
+			}
+			while (at < limit);
+	}
+}
+
+/* (a copy of draw_sprite_words for each way a row goes: left or right, 4 or 8 bits a pen, with the extra
+   palette's marks or without, so that none of it is asked about for every pixel) */
+static void draw_sprite_words_row(const sprite_drawing *sprite, const uint32_t *words, int x, int x_delta, int first,
+	int end)
+{
+	uint16_t *const row = sprite->row;
+	uint8_t *const marks = sprite->extra_row;
+
+	switch ((marks != NULL ? 4 : 0) | (sprite->bits8 ? 2 : 0) | (x_delta > 0 ? 1 : 0))
+	{
+		case 0: draw_sprite_words(sprite, words, row, marks, x, -1, first, end, false, false); break;
+		case 1: draw_sprite_words(sprite, words, row, marks, x, 1, first, end, false, false); break;
+		case 2: draw_sprite_words(sprite, words, row, marks, x, -1, first, end, true, false); break;
+		case 3: draw_sprite_words(sprite, words, row, marks, x, 1, first, end, true, false); break;
+		case 4: draw_sprite_words(sprite, words, row, marks, x, -1, first, end, false, true); break;
+		case 5: draw_sprite_words(sprite, words, row, marks, x, 1, first, end, false, true); break;
+		case 6: draw_sprite_words(sprite, words, row, marks, x, -1, first, end, true, true); break;
+		default: draw_sprite_words(sprite, words, row, marks, x, 1, first, end, true, true); break;
+	}
+}
+
 /* A sprite entry (8 words): flags, source height and width, screen height (and bank bits), screen
    width, y, x, the graphics' offset in the bank, and the color. Hands back how many more entries it
-   takes: an indirect table kept in the list takes two. */
-static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *inside, const area *outside)
+   takes: an indirect table kept in the list takes two. 'tables' is room for its pens' (SPRITE_PIXELS). */
+static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *inside, const area *outside,
+	int32_t *tables)
 {
 	static const uint16_t transparent_bits[4][4] = {
 		{ 0x7fff, 0x3fff, 0x1fff, 0x0fff },
@@ -992,9 +1173,13 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 	const int source_height = size >> 8;
 	const int height = height_word & 0x3ff;
 	const int width = width_word & 0x3ff;
-	/* the bank in bits 13 and 15 of the fourth word; bit 11 picks the screen */
-	const uint32_t bank = ((width_word & 0x2000) >> 13 | (width_word & 0x8000) >> 14) % (video.graphics.sprite_banks ? video.graphics.sprite_banks : 1);
+	/* the bank in bits 13 and 15 of the fourth word (no divide where the graphics have all four); bit 11
+	   picks the screen */
+	const uint32_t banks = video.graphics.sprite_banks ? video.graphics.sprite_banks : 1;
+	const uint32_t bank_bits = (width_word & 0x2000) >> 13 | (width_word & 0x8000) >> 14;
+	const uint32_t bank = bank_bits < banks ? bank_bits : bank_bits % banks;
 	const int screen = bit(width_word, 11);
+	const int buffer = video.shown_sprites ^ 1;
 	const int taken = (bit(flags, 13) && table_inline) ? 2 : 0;
 
 	if (!bit((uint32_t)video.screens_shown, screen))
@@ -1007,10 +1192,17 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 	int x_delta = 1;
 	int y_delta = 1;
 	int x_end;
-	int y_end;
 	int x_zoom;
 	int y_zoom;
-	int y_accumulator = 0;
+	int y_accumulator;
+	int first_row, end_row;
+	int first_column, end_column;
+	int left, right;
+	bool together;
+	uint32_t words_needed = 0;
+	const uint32_t *run = NULL;
+	uint32_t run_place = 0;
+	uint32_t run_count = 0;
 	uint32_t address = sprite_word(entry + 6) | (uint32_t)(height_word & 0xf000) << 4;
 
 	sprite.inside = inside;
@@ -1053,9 +1245,6 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 			end_pen == 0, pixels);
 	}
 
-	x_zoom = (((sprite.bits8 ? 4 : 8) * source_width) << 16) / width;
-	y_zoom = (source_height << 16) / height;
-
 	/* place it: the list's offset, then its alignment (0 or 3 centered, 1 by the far edge, 2 by the near) */
 	x = sign_extend(sprite_word(entry + 5), 12) + (bit(flags, 4) ? x_offset : 0) + video.sprite_side;
 	y = sign_extend(sprite_word(entry + 4), 12) + (bit(flags, 5) ? y_offset : 0);
@@ -1084,7 +1273,6 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 		y_delta = -1;
 	}
 	x_end = x + x_delta * width;
-	y_end = y + y_delta * height;
 
 	/* rows end at the sprite's width, or at the clip. (MAME tests a flipped sprite's end against the clip's
 	   right edge instead of its left one, so the sprite runs on to the left edge reading whatever follows
@@ -1103,17 +1291,84 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 			return taken;
 	}
 
-	for (int row = y; row != y_end; row += y_delta)
+	/* the sprite's rows and columns the clip shows, counted from its first: a thread's clip is its band of
+	   rows (draw_sprite_list), and most sprites have none there */
+	first_row = y_delta > 0 ? inside->top - y : y - inside->bottom;
+	end_row = y_delta > 0 ? inside->bottom - y + 1 : y - inside->top + 1;
+	if (first_row < 0)
+		first_row = 0;
+	if (end_row > height)
+		end_row = height;
+	first_column = x_delta > 0 ? inside->left - x : x - inside->right;
+	end_column = x_delta > 0 ? inside->right - x + 1 : x - inside->left + 1;
+	if (first_column < 0)
+		first_column = 0;
+	if (end_column > (x_end - x) * x_delta)
+		end_column = (x_end - x) * x_delta;
+	if (first_row >= end_row || first_column >= end_column)
+		return taken;
+
+	x_zoom = (((sprite.bits8 ? 4 : 8) * source_width) << 16) / width;
+	y_zoom = (source_height << 16) / height;
+	/* the zoom steps through the source rows: this far by the first row shown */
+	address += (uint32_t)(source_width * ((first_row * y_zoom) >> 16));
+	y_accumulator = (first_row * y_zoom) & 0xffff;
+
+	/* its rows are read from the words together in memory where the graphics have them so (draw_sprite_words);
+	   a shadow, graphics in sprite RAM and the rows the clip to leave alone crosses go the long way */
+	together = !sprite.shadow && !from_ram && video.graphics.sprite_words != NULL;
+	if (together)
 	{
-		if (row >= inside->top && row <= inside->bottom)
+		sprite.x_zoom = (uint32_t)x_zoom;
+		sprite.ends = end_pen != 0;
+		sprite.pixels = tables;
+		sprite_pens(&sprite, end_pen);
+		words_needed = (((uint32_t)(end_column - 1) * (uint32_t)x_zoom) >> (sprite.bits8 ? 16 + 2 : 16 + 3)) + 1;
+	}
+
+	left = x_delta > 0 ? x + first_column : x - (end_column - 1);
+	right = left + (end_column - first_column);
+	for (int number = first_row; number < end_row; number++)
+	{
+		const int row = y + number * y_delta;
+		const bool outside_row = row >= outside->top && row <= outside->bottom;
+		const uint32_t *words = NULL;
+
+		sprite.row = video.sprites[screen][buffer][row];
+		if (video.extra_used)
 		{
-			sprite.row = video.sprites[screen][video.shown_sprites ^ 1][row];
-			if (video.extra_used)
-				sprite.extra_row = video.extra_pixels[screen][video.shown_sprites ^ 1][row];
-			sprite.outside_row = row >= outside->top && row <= outside->bottom;
+			/* the marks are 0 almost everywhere: a row's are written only once a sprite put some other in
+			   it, and until then they are neither written nor erased, a third less to carry about */
+			if (sprite.extra != 0)
+				video.sprites_marked[screen][buffer][row] = true;
+			sprite.extra_row = video.sprites_marked[screen][buffer][row] ? video.extra_pixels[screen][buffer][row] : NULL;
+		}
+		/* (for the next erase, and for the next list's bands) */
+		if (left < video.sprites_left[screen][buffer][row])
+			video.sprites_left[screen][buffer][row] = (uint16_t)left;
+		if (right > video.sprites_right[screen][buffer][row])
+			video.sprites_right[screen][buffer][row] = (uint16_t)right;
+		video.sprite_work[row] += (uint32_t)(end_column - first_column) + 16;
+		if (together && !outside_row && (address & 0xfffff) + words_needed <= 0x100000)
+		{
+			/* the row's words, if they are all in one piece: the last one asked for, or a new one */
+			const uint32_t place = (bank << 20) | (address & 0xfffff);
+
+			if (place - run_place >= run_count || run_count - (place - run_place) < words_needed)
+			{
+				run = video.graphics.sprite_words(place, &run_count);
+				run_place = place;
+			}
+			if (run != NULL && run_count - (place - run_place) >= words_needed)
+				words = run + (place - run_place);
+		}
+		if (words != NULL)
+			draw_sprite_words_row(&sprite, words, x, x_delta, first_column, end_column);
+		else
+		{
+			sprite.outside_row = outside_row;
 			draw_sprite_row(&sprite, from_ram, bank, address, x, x_end, x_delta, x_zoom, end_pen);
 		}
-		/* the zoom steps through the source rows */
 		y_accumulator += y_zoom;
 		address += (uint32_t)(source_width * (y_accumulator >> 16));
 		y_accumulator &= 0xffff;
@@ -1124,8 +1379,9 @@ static int draw_sprite(uint32_t entry, int x_offset, int y_offset, const area *i
 /* The list in sprite RAM from its entry 'number', 16 bytes an entry, its command in the top two bits of the
    first word: draw a sprite, set the clips (bit 12 the one to draw in, bit 13 the one to leave alone), jump
    (and with bit 13, set the offset sprites can add), or end. The board's starts at 0. Only its rows from
-   first_row to last_row are drawn: each thread walks the whole list for a band of them (draw_sprites) */
-static void draw_sprite_list(int number, int first_row, int last_row)
+   first_row to last_row are drawn: each thread walks the whole list for a band of them (draw_sprites), with
+   'tables' for the pens of the sprite it is at */
+static void draw_sprite_list(int number, int first_row, int last_row, int32_t *tables)
 {
 	/* (WIDE: the board's screen of 320 in the middle of a wider one, the sprites placed that much to the right) */
 	const bool board_wide = bit(s32_board.sprite_control_latched[6], 0);
@@ -1145,7 +1401,7 @@ static void draw_sprite_list(int number, int first_row, int last_row)
 		switch (command >> 14)
 		{
 			case 0:
-				number += 1 + draw_sprite(entry, x_offset, y_offset, &inside, &outside);
+				number += 1 + draw_sprite(entry, x_offset, y_offset, &inside, &outside, tables);
 				break;
 			case 1:
 				if (bit(command, 12))
@@ -1189,40 +1445,131 @@ static void draw_sprite_list(int number, int first_row, int last_row)
 	}
 }
 
-static void draw_sprite_list_rows(void *context, int first_row, int last_row)
+/* What the threads share out of a list: not its rows dealt evenly, as s32_workers_rows would, since the
+   sprites are not spread so (a race's are about the middle of the screen: of three bands of rows, the middle
+   one had over half the work), but bands of as much work each, a row's being what the list before drew on
+   it. s32_workers_rows deals the bands themselves: a thread draws the ones it is handed, one as a rule. */
+#define SPRITE_BANDS_MOST 8
+
+typedef struct sprite_bands
 {
-	draw_sprite_list(*(const int *)context, first_row, last_row);
+	int number;                         /* the list's first entry */
+	bool erase;                         /* the rows are erased before they are drawn on */
+	int rows[SPRITE_BANDS_MOST + 1];    /* each band's first row, and one past the last's last */
+} sprite_bands;
+
+/* Each band's room for the pens of the sprite its thread is at (sprite_pens): 4 KB that a thread's stack
+   need not hold. No two threads draw the same band. */
+static int32_t sprite_tables[SPRITE_BANDS_MOST][SPRITE_PIXELS];
+
+/* Rows of every screen's sprite buffer 'buffer' erased: no sprite there (0xffff a pixel), no marks. Only
+   where something was drawn since they last were (draw_sprite keeps the columns, and the rows with marks):
+   the rest of the 218 KB of a buffer and the 109 KB of its marks is erased as it is, and a screen the port
+   does not show, whose sprites draw_sprite leaves alone, has nothing to erase after its first time */
+static void erase_sprite_rows(int buffer, int first_row, int last_row)
+{
+	for (int screen = 0; screen < S32_SCREENS; screen++)
+		for (int row = first_row; row <= last_row; row++)
+		{
+			const int left = video.sprites_left[screen][buffer][row];
+			const int right = video.sprites_right[screen][buffer][row];
+
+			if (video.extra_used && video.sprites_marked[screen][buffer][row])
+			{
+				memset(video.extra_pixels[screen][buffer][row], 0, sizeof(video.extra_pixels[screen][buffer][row]));
+				video.sprites_marked[screen][buffer][row] = false;
+			}
+			if (left >= right)
+				continue;
+			memset(&video.sprites[screen][buffer][row][left], 0xff, (size_t)(right - left) * sizeof(uint16_t));
+			video.sprites_left[screen][buffer][row] = WIDTH;
+			video.sprites_right[screen][buffer][row] = 0;
+		}
 }
 
-/* The list from its entry 'number', a band of its rows on each of the workers' threads; on this one alone
-   while an observer watches the sprites (it sees them in the list's order) */
-static void draw_sprites(int number)
+/* Every column of every screen's sprite buffer 'buffer' taken as drawn on, for its next erase to be of all of
+   it: one not erased yet, or one whose pixels were put there by other than draw_sprite */
+static void sprites_all_drawn(int buffer)
+{
+	for (int screen = 0; screen < S32_SCREENS; screen++)
+		for (int row = 0; row < HEIGHT; row++)
+		{
+			video.sprites_left[screen][buffer][row] = 0;
+			video.sprites_right[screen][buffer][row] = WIDTH;
+		}
+}
+
+static void draw_sprite_list_rows(void *context, int first, int last)
+{
+	const sprite_bands *bands = context;
+
+	for (int band = first; band <= last; band++)
+	{
+		const int first_row = bands->rows[band];
+		const int last_row = bands->rows[band + 1] - 1;
+
+		if (first_row > last_row)
+			continue;
+		/* (erased by the thread that draws them, just before: the rows are in its cache for the sprites) */
+		if (bands->erase)
+			erase_sprite_rows(video.shown_sprites ^ 1, first_row, last_row);
+		draw_sprite_list(bands->number, first_row, last_row, sprite_tables[band]);
+	}
+}
+
+/* The list from its entry 'number' into the buffer not shown, erased first if 'erase', a band of its rows on
+   each of the workers' threads; on this one alone while an observer watches the sprites (it sees them in the
+   list's order) */
+static void draw_sprites(int number, bool erase)
 {
 	const bool wide = video.wide_side != 0 && !bit(s32_board.sprite_control_latched[6], 0);
 
 	video.sprite_side = wide ? video.wide_side : 0;
 	if (s32_video_sprite_observer != NULL)
-		draw_sprite_list(number, 0, HEIGHT - 1);
+	{
+		if (erase)
+			erase_sprite_rows(video.shown_sprites ^ 1, 0, HEIGHT - 1);
+		draw_sprite_list(number, 0, HEIGHT - 1, sprite_tables[0]);
+	}
 	else
-		s32_workers_rows(draw_sprite_list_rows, &number, 0, HEIGHT - 1);
+	{
+		const int threads = s32_workers_count() + 1;
+		const uint32_t count = (uint32_t)(threads < SPRITE_BANDS_MOST ? threads : SPRITE_BANDS_MOST);
+		sprite_bands bands;
+		uint64_t work = 0;
+		uint64_t done = 0;
+		uint32_t band = 1;
+
+		/* (a row with no sprite still counts 1: with nothing drawn yet the bands are of as many rows each) */
+		for (int row = 0; row < HEIGHT; row++)
+			work += 1 + video.sprite_work[row];
+		bands.number = number;
+		bands.erase = erase;
+		bands.rows[0] = 0;
+		for (int row = 0; row < HEIGHT; row++)
+		{
+			/* band n starts at the first row with n of 'count' parts of the work before it */
+			while (band < count && done * count >= work * band)
+				bands.rows[band++] = row;
+			done += 1 + video.sprite_work[row];
+			video.sprite_work[row] = 0;
+		}
+		while (band <= count)
+			bands.rows[band++] = HEIGHT;
+		s32_workers_rows(draw_sprite_list_rows, &bands, 0, (int)count - 1);
+	}
 }
 
+/* The board erases the buffer shown and then, the two swapped, draws the list into it: both in one go over
+   the rows when it asks for both, as the game does every frame */
 void s32_video_sprites(bool erase, bool draw)
 {
-	if (erase)
-		for (int screen = 0; screen < S32_SCREENS; screen++)
-		{
-			uint16_t *shown = &video.sprites[screen][video.shown_sprites][0][0];
-
-			for (size_t index = 0; index < (size_t)HEIGHT * WIDTH; index++)
-				shown[index] = 0xffff;
-			if (video.extra_used)
-				memset(video.extra_pixels[screen][video.shown_sprites], 0, sizeof(video.extra_pixels[screen][0]));
-		}
+	if (erase && !draw)
+		erase_sprite_rows(video.shown_sprites, 0, HEIGHT - 1);
 	if (draw)
 	{
 		video.shown_sprites ^= 1;
-		draw_sprites(0);
+		draw_sprites(0, erase);
 	}
 }
 
@@ -1247,7 +1594,7 @@ void s32_video_overlay_sprites(const uint8_t *list, size_t size)
 	memcpy(sprite_ram_saved, place, size);
 	memcpy(place, list, size);
 	video.shown_sprites ^= 1;    /* (the list draws into the buffer not shown: this one) */
-	draw_sprites(OVERLAY_ENTRY);
+	draw_sprites(OVERLAY_ENTRY, false);
 	video.shown_sprites ^= 1;
 	memcpy(place, sprite_ram_saved, size);
 }
@@ -1259,6 +1606,8 @@ void s32_video_overlay_end(void)
 	overlay_on = false;
 	for (int screen = 0; screen < S32_SCREENS; screen++)
 		memcpy(video.sprites[screen][video.shown_sprites], overlay_saved[screen], sizeof(overlay_saved[screen]));
+	/* (they may not be the ones this buffer held: the board can have swapped the two since they were kept) */
+	sprites_all_drawn(video.shown_sprites);
 }
 
 /* ---- the mixer ---- */
@@ -1632,6 +1981,8 @@ void s32_video_init_graphics(const s32_graphics *graphics)
 	video.sprite_rom_words = sprite_rom_words;
 	video.visible.right = 319;
 	video.visible.bottom = HEIGHT - 1;
+	sprites_all_drawn(0);    /* (the sprite buffers are not erased yet) */
+	sprites_all_drawn(1);
 	s32_board.sprites_due = s32_video_sprites;
 	s32_board.frame_shown = s32_video_draw_frame;
 }
@@ -1675,6 +2026,7 @@ void s32_video_init(const uint8_t *tiles, size_t tiles_size, const uint8_t *spri
 	graphics.tile_count = count;
 	graphics.sprite_word = image_sprite_word;
 	graphics.sprite_banks = video.sprite_rom_words >> 20;
+	graphics.sprite_words = NULL;    /* (the image's words are big endian: each is read through sprite_word) */
 	s32_video_init_graphics(&graphics);
 }
 
