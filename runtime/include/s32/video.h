@@ -54,6 +54,20 @@ void s32_video_init(const uint8_t *tiles, size_t tiles_size, const uint8_t *spri
 void s32_video_sprites(bool erase, bool draw);
 void s32_video_draw_frame(void);
 
+/* A frame in two halves, for a port that draws it while the game runs the next one: _begin takes the frame
+   from the board as it is (a copy of what the video reads of it) and, with s32_video_set_overlap on, returns
+   at once while the workers' threads draw it (s32/workers.h); _end returns when it is drawn, the caller's
+   thread taking what rows are left. s32_video_draw_frame is one after the other. s32_video_frame and
+   s32_video_frame_hash end the frame begun themselves */
+void s32_video_draw_frame_begin(void);
+void s32_video_draw_frame_end(void);
+
+/* Overlap, off unless a port turns it on: the frames begun, and the sprite lists the board sends, are drawn
+   on the workers' threads while the caller goes on, in the order they were asked for and from copies of the
+   board's memories taken as they were asked for: the same pixels, later. With no threads they are drawn when
+   something waits for them (the next frame's _begin, s32_video_draw_frame_end) */
+void s32_video_set_overlap(bool on);
+
 /* The last frame of screen 0 (left) or 1 (right): S32_VIDEO_MAX_WIDTH pixels a row, S32_VIDEO_HEIGHT rows;
    its width is 320 or 416 */
 const uint32_t *s32_video_frame(int screen, int *width);

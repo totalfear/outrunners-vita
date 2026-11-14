@@ -1,19 +1,26 @@
 /**
  *    Name:        workers.c
- *    Description: threads that take bands of a frame's rows (workers.h): Windows' threads, POSIX threads, or
- *                 on the Switch libnx's, each on a core of its own
- *    Version:     0.1.0
+ *    Description: threads that take the rows of a frame's work, and the tasks queued for them (workers.h):
+ *                 Windows' threads, POSIX threads, or on the Switch libnx's, each on a core of its own
+ *    Version:     0.2.0
  *    Created:     23-10-2026
- *    Modified:    23-10-2026
+ *    Modified:    14-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
- *    Each call is a new job: the threads wake, take their band (worker n the band n + 1; the caller band 0)
- *    and say they are done; the caller waits for all of them. Rows are split evenly, so the bands differ by
- *    one row at most.
+ *    One lock keeps it all. A job is rows shared out: who shares them and every thread with nothing else to
+ *    do take a few at a time until none is left, and who shared them waits for the last ones to be done. So
+ *    the threads there are do the rows, however many they are at the moment: a thread that comes late takes
+ *    what is left, and none waits beside rows not taken.
+ *
+ *    A task is work one thread does by itself, the tasks one after another in the order they were queued,
+ *    while who queued them goes on; a task shares rows out as anyone does. s32_workers_finish is how the
+ *    caller waits for one: until it is done the caller is one more thread, for rows and for the tasks before
+ *    it. With no threads the tasks wait in the queue, and s32_workers_finish does them.
  */
 #include "s32/workers.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,7 +32,6 @@ typedef CONDITION_VARIABLE pool_signal;
 #define UNLOCK(lock) ReleaseSRWLockExclusive(lock)
 #define WAIT(signal, lock) SleepConditionVariableSRW(signal, lock, INFINITE, 0)
 #define WAKE_ALL(signal) WakeAllConditionVariable(signal)
-#define WAKE(signal) WakeConditionVariable(signal)
 #elif defined(__SWITCH__)
 #include <switch.h>
 typedef Mutex pool_lock;
@@ -34,7 +40,6 @@ typedef CondVar pool_signal;
 #define UNLOCK(lock) mutexUnlock(lock)
 #define WAIT(signal, lock) condvarWait(signal, lock)
 #define WAKE_ALL(signal) condvarWakeAll(signal)
-#define WAKE(signal) condvarWakeOne(signal)
 #else
 #include <pthread.h>
 typedef pthread_mutex_t pool_lock;
@@ -43,66 +48,87 @@ typedef pthread_cond_t pool_signal;
 #define UNLOCK(lock) pthread_mutex_unlock(lock)
 #define WAIT(signal, lock) pthread_cond_wait(signal, lock)
 #define WAKE_ALL(signal) pthread_cond_broadcast(signal)
-#define WAKE(signal) pthread_cond_signal(signal)
 #endif
 
 #define WORKERS_MOST 7
+#define TASKS_MOST   8    /* queued and not done: one more waits for the oldest */
+#define BANDS_A_THREAD 2  /* s32_workers_rows: the bands the rows are shared out in, for each thread there is */
 
 static struct
 {
 	int count;
 	pool_lock lock;
-	pool_signal job_ready;
-	pool_signal job_done;
-	unsigned job;            /* the job's number: a worker takes each once */
-	int done;                /* workers done with it */
+	pool_signal changed;     /* there are rows to take or a task, or a job's last rows or a task are done */
+
+	/* the job: the rows being shared out, one job at a time */
 	s32_rows_work work;
 	void *context;
-	int first;
+	int next;                /* the first row not taken yet */
 	int last;
+	int step;                /* the rows a thread takes at a time */
+	int taking;              /* threads at work on rows they took */
+
+	/* the tasks, by their numbers: task n is in tasks[n % TASKS_MOST] until it is done */
+	struct
+	{
+		s32_task_work work;
+		void *context;
+	} tasks[TASKS_MOST];
+	unsigned queued;         /* the number of the last one queued */
+	unsigned started;        /* of the last one a thread took */
+	unsigned done;           /* of the last one done: the next is taken when started == done */
 #ifdef __SWITCH__
 	Thread threads[WORKERS_MOST];
 #endif
-} pool;
+} pool = { .last = -1 };
 
-/* Band 'band' of 'bands' of rows first..last */
-static void run_band(s32_rows_work work, void *context, int first, int last, int band, int bands)
+/* The next rows of the job, if any are left, done by the calling thread. The lock is held when it is called
+   and when it returns, and not while the rows are worked */
+static bool take_rows(void)
 {
-	const int rows = last - first + 1;
-	const int from = first + rows * band / bands;
-	const int to = first + rows * (band + 1) / bands - 1;
+	const s32_rows_work work = pool.work;
+	void *const context = pool.context;
+	const int from = pool.next;
+	const int to = pool.last - from < pool.step ? pool.last : from + pool.step - 1;
 
-	if (from <= to)
-		work(context, from, to);
+	if (from > pool.last)
+		return false;
+	pool.next = to + 1;
+	pool.taking++;
+	UNLOCK(&pool.lock);
+	work(context, from, to);
+	LOCK(&pool.lock);
+	if (--pool.taking == 0 && pool.next > pool.last)
+		WAKE_ALL(&pool.changed);    /* (the job's last rows: who shared them out waits for these) */
+	return true;
+}
+
+/* The next task, if one waits and none is running, done by the calling thread; the lock as in take_rows */
+static bool take_task(void)
+{
+	s32_task_work work;
+	void *context;
+
+	if (pool.started == pool.queued || pool.started != pool.done)
+		return false;
+	pool.started++;
+	work = pool.tasks[pool.started % TASKS_MOST].work;
+	context = pool.tasks[pool.started % TASKS_MOST].context;
+	UNLOCK(&pool.lock);
+	work(context);
+	LOCK(&pool.lock);
+	pool.done++;
+	WAKE_ALL(&pool.changed);    /* (who waits for it; and the next task can be taken) */
+	return true;
 }
 
 static void worker_loop(int number)
 {
-	unsigned seen = 0;
-
+	(void)number;
+	LOCK(&pool.lock);
 	for (;;)
-	{
-		s32_rows_work work;
-		void *context;
-		int first, last;
-
-		LOCK(&pool.lock);
-		while (pool.job == seen)
-			WAIT(&pool.job_ready, &pool.lock);
-		seen = pool.job;
-		work = pool.work;
-		context = pool.context;
-		first = pool.first;
-		last = pool.last;
-		UNLOCK(&pool.lock);
-
-		run_band(work, context, first, last, number + 1, pool.count + 1);
-
-		LOCK(&pool.lock);
-		if (++pool.done == pool.count)
-			WAKE(&pool.job_done);
-		UNLOCK(&pool.lock);
-	}
+		if (!take_rows() && !take_task())
+			WAIT(&pool.changed, &pool.lock);
 }
 
 #if defined(_WIN32)
@@ -128,20 +154,18 @@ void s32_workers_start(int count)
 {
 	if (pool.count > 0 || count <= 0)
 		return;
+	s32_workers_finish_all();    /* (tasks queued while there were no threads: done as they would have been) */
 	if (count > WORKERS_MOST)
 		count = WORKERS_MOST;
 #if defined(_WIN32)
 	InitializeSRWLock(&pool.lock);
-	InitializeConditionVariable(&pool.job_ready);
-	InitializeConditionVariable(&pool.job_done);
+	InitializeConditionVariable(&pool.changed);
 #elif defined(__SWITCH__)
 	mutexInit(&pool.lock);
-	condvarInit(&pool.job_ready);
-	condvarInit(&pool.job_done);
+	condvarInit(&pool.changed);
 #else
 	pthread_mutex_init(&pool.lock, NULL);
-	pthread_cond_init(&pool.job_ready, NULL);
-	pthread_cond_init(&pool.job_done, NULL);
+	pthread_cond_init(&pool.changed, NULL);
 #endif
 	for (int number = 0; number < count; number++)
 	{
@@ -172,7 +196,7 @@ int s32_workers_count(void)
 	return pool.count;
 }
 
-void s32_workers_rows(s32_rows_work work, void *context, int first, int last)
+void s32_workers_rows_by(s32_rows_work work, void *context, int first, int last, int step)
 {
 	if (pool.count == 0)
 	{
@@ -180,19 +204,79 @@ void s32_workers_rows(s32_rows_work work, void *context, int first, int last)
 		return;
 	}
 	LOCK(&pool.lock);
+	while (pool.next <= pool.last || pool.taking > 0)
+		WAIT(&pool.changed, &pool.lock);    /* (one job at a time: another thread's is let finish first) */
 	pool.work = work;
 	pool.context = context;
-	pool.first = first;
+	pool.next = first;
 	pool.last = last;
-	pool.done = 0;
-	pool.job++;
-	WAKE_ALL(&pool.job_ready);
+	pool.step = step > 0 ? step : 1;
+	WAKE_ALL(&pool.changed);
+	while (take_rows())
+		;
+	while (pool.taking > 0)
+		WAIT(&pool.changed, &pool.lock);
 	UNLOCK(&pool.lock);
+}
 
-	run_band(work, context, first, last, 0, pool.count + 1);
+void s32_workers_rows(s32_rows_work work, void *context, int first, int last)
+{
+	/* two bands for each thread, as even as they come: the rows do not all cost the same (the sprites are
+	   where the road is), and a thread that ends a light band takes another instead of waiting beside a
+	   heavy one */
+	const int bands = BANDS_A_THREAD * (pool.count + 1);
 
+	s32_workers_rows_by(work, context, first, last, (last - first + bands) / bands);
+}
+
+unsigned s32_workers_queue(s32_task_work work, void *context)
+{
+	unsigned number;
+
+	if (pool.count == 0)
+	{
+		if (pool.queued - pool.done == TASKS_MOST)
+			s32_workers_finish(pool.done + 1);
+		number = ++pool.queued;
+		pool.tasks[number % TASKS_MOST].work = work;
+		pool.tasks[number % TASKS_MOST].context = context;
+		return number;
+	}
 	LOCK(&pool.lock);
-	while (pool.done < pool.count)
-		WAIT(&pool.job_done, &pool.lock);
+	while (pool.queued - pool.done == TASKS_MOST)
+		if (!take_rows() && !take_task())
+			WAIT(&pool.changed, &pool.lock);
+	number = ++pool.queued;
+	pool.tasks[number % TASKS_MOST].work = work;
+	pool.tasks[number % TASKS_MOST].context = context;
+	WAKE_ALL(&pool.changed);
 	UNLOCK(&pool.lock);
+	return number;
+}
+
+void s32_workers_finish(unsigned number)
+{
+	if (pool.count == 0)
+	{
+		/* (no threads: the caller does them, in their order) */
+		while ((int)(pool.done - number) < 0 && pool.done != pool.queued)
+		{
+			const unsigned next = pool.done + 1;
+
+			pool.started = next;
+			pool.tasks[next % TASKS_MOST].work(pool.tasks[next % TASKS_MOST].context);
+			pool.done = next;
+		}
+		return;
+	}
+	LOCK(&pool.lock);
+	while ((int)(pool.done - number) < 0 && pool.done != pool.queued)
+		if (!take_rows() && !take_task())
+			WAIT(&pool.changed, &pool.lock);
+	UNLOCK(&pool.lock);
+}
+
+void s32_workers_finish_all(void)
+{
+	s32_workers_finish(pool.queued);    /* (only the caller queues: the last one queued is the last there is) */
 }
