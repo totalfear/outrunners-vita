@@ -85,8 +85,39 @@ void move_block(uint16_t source, uint16_t destination, uint16_t count, bool upwa
 /* A jump through a table to an entry the table does not have: the original would run whatever is there */
 void sound_invalid_jump(uint32_t address);    /* the default of a switch on a jump table's index */
 
-void z80_block(int cycles, int fetches);
-void z80_cycles(int cycles);
+/* The Z80's time (sound_cpu.c keeps it). It is here because the program starts a block some five thousand
+   times a frame, and all but a few hundred of those starts have nothing to do but count: no timer has run
+   out and no interrupt can be taken before the cycle 'event', which sound_cpu.c works out whenever one of
+   the things it hangs on changes. Those starts are the few instructions below, with no call. */
+typedef struct sound_z80_time
+{
+	uint64_t clock;            /* where the next block starts, Z80 cycles */
+	uint64_t event;            /* the first cycle at which a block's start has more to do than count */
+	uint64_t block_clock;      /* where the block that is running started: when its accesses happen */
+	uint32_t refresh;          /* opcode fetches so far */
+	uint32_t block_refresh;    /* ... when the block started */
+} sound_z80_time;
+
+extern sound_z80_time sound_z80;
+
+/* A block starts at or past the event: the timers due run out, an interrupt is taken if one can be, and
+   the next event is found */
+void z80_block_event(void);
+
+static inline void z80_block(int cycles, int fetches)
+{
+	if (sound_z80.clock >= sound_z80.event)
+		z80_block_event();
+	sound_z80.block_clock = sound_z80.clock;
+	sound_z80.clock += (uint64_t)cycles;
+	sound_z80.block_refresh = sound_z80.refresh;
+	sound_z80.refresh += (uint32_t)fetches;
+}
+
+static inline void z80_cycles(int cycles)
+{
+	sound_z80.clock += (uint64_t)cycles;
+}
 
 /* The refresh register (seven bits, the eighth as LD R,A left it) after the block's first 'fetches' opcode
    fetches */

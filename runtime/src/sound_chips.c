@@ -30,6 +30,15 @@
 #define STACK_START         0xFD00u                                     /* the Z80's stack, FD00-FDFF: not in the hash */
 #define STACK_END           0xFE00u
 
+/* The samples of 'period' board cycles (a constant) that start in the 'span' of board cycles after one
+   starts. A frame is 333,333 board cycles, so the span fits 32 bits and this is no 64-bit divide, which a
+   processor with no divide instruction (the Vita's) calls a function for, at every write to a chip. */
+#define SAMPLES_IN(span, period) \
+	((span) <= UINT32_MAX - (period) ? (uint64_t)(((uint32_t)(span) + (uint32_t)(period) - 1) / (uint32_t)(period)) \
+		: ((span) + (period) - 1) / (period))
+
+_Static_assert(S32_CPU_CLOCK * 2u == S32_SOUND_CLOCK * 5u, "fm_span: the board's clock is no longer 5/2 of the Z80's");
+
 /* The samples a chip has made and the frame has not taken yet: its two outputs, from sample 'first' on */
 typedef struct sample_buffer
 {
@@ -49,8 +58,14 @@ static struct
 	multipcm pcm;
 	uint64_t pcm_samples;
 	sample_buffer pcm_buffer;
+	const uint8_t *pcm_image;           /* the MultiPCM's 4 MB in one piece, for its voices to read, or none */
+	uint8_t *pcm_copy;                  /* ... as made here, when the board only has them a byte a call */
+	const uint8_t *pcm_image_rom;       /* what the image was taken from: s32_board.pcm_rom and pcm_at then */
+	uint8_t (*pcm_image_at)(uint32_t place);
+	int pcm_mapped_bank;                /* the bank byte the chip's pages are mapped for; -1 none, -2 unmapped */
 	uint64_t override;                  /* while a timer runs out: its own time */
 	uint64_t frame_hash;
+	bool frame_hash_due;                /* the frame's samples are not hashed yet */
 	int32_t *frame[2];                  /* the frame's samples, for the mix */
 	size_t frame_counts[2];
 	size_t frame_capacity[2];
@@ -69,32 +84,41 @@ static uint64_t now(void)
 /* board cycles 'clocks' of the YM3438 (which runs on the Z80's clock) take, rounded up */
 static uint64_t fm_span(uint64_t clocks)
 {
-	return (clocks * S32_CPU_CLOCK + S32_SOUND_CLOCK - 1) / S32_SOUND_CLOCK;
+	/* 20 MHz over 8 MHz is exactly 5/2: half of five times as many, rounded up, and no 64-bit divide */
+	return (clocks * 5u + 1) >> 1;
 }
 
-static void append(sample_buffer *buffer, int32_t first, int32_t second)
+/* Where the buffer's next 'values' values go: room is made for them, and the caller counts them in */
+static int32_t *room_for(sample_buffer *buffer, size_t values)
 {
-	if (buffer->count + 2 > buffer->capacity)
+	if (buffer->count + values > buffer->capacity)
 	{
-		buffer->capacity = buffer->capacity ? buffer->capacity * 2 : 4096;
+		while (buffer->count + values > buffer->capacity)
+			buffer->capacity = buffer->capacity ? buffer->capacity * 2 : 4096;
 		buffer->data = (int32_t *)realloc(buffer->data, buffer->capacity * sizeof(int32_t));
 	}
-	buffer->data[buffer->count++] = first;
-	buffer->data[buffer->count++] = second;
+	return buffer->data + buffer->count;
 }
 
 /* ---- the YM3438 ---- */
 
+/* Makes the samples that start before 'time': sample n starts at n x FM_PERIOD */
 static void fm_catch_up(uint64_t time)
 {
-	const uint64_t due = (time + FM_PERIOD - 1) / FM_PERIOD;
-	int32_t out[2];
+	const uint64_t next = sound.fm_samples * FM_PERIOD;
+	uint64_t due;
 
-	while (sound.fm_samples < due)
+	if (next >= time)
+		return;
+	due = SAMPLES_IN(time - next, FM_PERIOD);
+	while (due)
 	{
-		s32_fm_generate(&sound.fm, out);
-		append(&sound.fm_buffer, out[0], out[1]);
-		sound.fm_samples++;
+		const size_t count = due > 4096 ? 4096 : (size_t)due;
+
+		s32_fm_generate_many(&sound.fm, room_for(&sound.fm_buffer, count * 2), (int)count);
+		sound.fm_buffer.count += count * 2;
+		sound.fm_samples += count;
+		due -= count;
 	}
 }
 
@@ -130,6 +154,11 @@ static uint64_t fm_next_timer(void)
 	return sound.deadline[0] < sound.deadline[1] ? sound.deadline[0] : sound.deadline[1];
 }
 
+uint64_t sound_chips_next_timer(void)
+{
+	return fm_next_timer();
+}
+
 void sound_chips_timers_due(uint64_t time)
 {
 	/* the timers due by 'time', in the order they run out */
@@ -159,20 +188,73 @@ static void fm_write(int offset, uint8_t data)
 
 /* ---- the MultiPCM ---- */
 
+/* The MultiPCM's 4 MB in one piece: the board's image or, when it only has s32_board.pcm_at (the game's
+   assets: a call and a search of the samples' list for every byte), a copy made once of what that gives.
+   Every voice reads a byte or two of it for every sample, 744 samples a frame. With no memory for the
+   copy the voices go on reading through the board. */
+static void pcm_take_image(void)
+{
+	sound.pcm_image = s32_board.pcm_rom;
+	if (!sound.pcm_image && s32_board.pcm_at)
+	{
+		if (!sound.pcm_copy)
+			sound.pcm_copy = (uint8_t *)malloc(S32_PCM_ROM_SIZE);
+		if (sound.pcm_copy)
+			for (uint32_t place = 0; place < S32_PCM_ROM_SIZE; place++)
+				sound.pcm_copy[place] = s32_board.pcm_at(place);
+		sound.pcm_image = sound.pcm_copy;
+	}
+	sound.pcm_image_rom = s32_board.pcm_rom;
+	sound.pcm_image_at = s32_board.pcm_at;
+	sound.pcm_mapped_bank = -1;
+}
+
+/* The chip's pages on the image as the board's banks have it now (s32_pcm_sample_read: 1 MB fixed, then a
+   512 KB page for each of the two banks, and all of it once more above 2 MB); on nothing if the board's
+   samples are no longer the ones the image was taken from */
+static void pcm_map_banks(void)
+{
+	const bool current = sound.pcm_image && s32_board.pcm_rom == sound.pcm_image_rom && s32_board.pcm_at == sound.pcm_image_at;
+	const int bank = current ? s32_board.pcm_bank : -2;
+
+	if (bank == sound.pcm_mapped_bank)
+		return;
+	sound.pcm_mapped_bank = bank;
+	for (int half = 0; half < MULTIPCM_PAGES; half += 4)
+	{
+		multipcm_map(&sound.pcm, half, current ? sound.pcm_image : NULL);
+		multipcm_map(&sound.pcm, half + 1, current ? sound.pcm_image + 0x80000 : NULL);
+		multipcm_map(&sound.pcm, half + 2, current ? sound.pcm_image + (size_t)(bank & 7) * 0x80000 : NULL);
+		multipcm_map(&sound.pcm, half + 3, current ? sound.pcm_image + (size_t)((bank >> 3) & 7) * 0x80000 : NULL);
+	}
+}
+
+/* Makes the samples that start before 'time': sample n starts at n x PCM_PERIOD */
 static void pcm_catch_up(uint64_t time)
 {
-	const uint64_t due = (time + PCM_PERIOD - 1) / PCM_PERIOD;
+	const uint64_t next = sound.pcm_samples * PCM_PERIOD;
+	uint64_t due;
 	int32_t first[256];
 	int32_t second[256];
 
-	while (sound.pcm_samples < due)
+	if (next >= time)
+		return;
+	pcm_map_banks();
+	due = SAMPLES_IN(time - next, PCM_PERIOD);
+	while (due)
 	{
-		const int count = due - sound.pcm_samples > 256 ? 256 : (int)(due - sound.pcm_samples);
+		const int count = due > 256 ? 256 : (int)due;
+		int32_t *both = room_for(&sound.pcm_buffer, (size_t)count * 2);
 
 		multipcm_generate(&sound.pcm, first, second, count);
 		for (int index = 0; index < count; index++)
-			append(&sound.pcm_buffer, first[index], second[index]);
+		{
+			both[index * 2] = first[index];
+			both[index * 2 + 1] = second[index];
+		}
+		sound.pcm_buffer.count += (size_t)count * 2;
 		sound.pcm_samples += (uint64_t)count;
+		due -= (uint64_t)count;
 	}
 }
 
@@ -213,8 +295,8 @@ static uint64_t hash_samples(const int32_t *samples, size_t count, uint64_t hash
 	return hash;
 }
 
-/* the samples before sample number 'due': hashed and moved to the frame's list 'which' */
-static uint64_t take(sample_buffer *buffer, uint64_t due, uint64_t hash, int which)
+/* the samples before sample number 'due': moved to the frame's list 'which' */
+static void take(sample_buffer *buffer, uint64_t due, int which)
 {
 	size_t values = (size_t)(due - buffer->first) * 2;
 
@@ -231,7 +313,6 @@ static uint64_t take(sample_buffer *buffer, uint64_t due, uint64_t hash, int whi
 	memmove(buffer->data, buffer->data + values, (buffer->count - values) * sizeof(int32_t));
 	buffer->count -= values;
 	buffer->first += values / 2;
-	return hash_samples(sound.frame[which], values, hash);
 }
 
 static int16_t clamp16(double value)
@@ -246,6 +327,8 @@ static void mix(void)
 {
 	const size_t frames = sound.frame_counts[0] / 2;
 	const size_t pcm_frames = sound.frame_counts[1] / 2;
+	size_t whole = 0;       /* index x pcm_frames / frames, kept by counting: no divide a sample */
+	size_t rest = 0;        /* ... and what is left over, less than frames */
 
 	if (frames * 2 > sound.mix_capacity)
 	{
@@ -254,14 +337,10 @@ static void mix(void)
 	}
 	for (size_t index = 0; index < frames; index++)
 	{
-		size_t at = 0;
+		const size_t at = pcm_frames && whole > pcm_frames - 1 ? pcm_frames - 1 : whole;
 
-		if (pcm_frames)
-		{
-			at = index * pcm_frames / (frames ? frames : 1);
-			if (at > pcm_frames - 1)
-				at = pcm_frames - 1;
-		}
+		for (rest += pcm_frames; rest >= frames; rest -= frames)
+			whole++;
 		for (int side = 0; side < 2; side++)
 		{
 			const int output = 1 - side;
@@ -281,17 +360,24 @@ static void mix(void)
 
 void sound_chips_end_frame(uint64_t time)
 {
-	uint64_t hash = 0xcbf29ce484222325ull;
-
 	fm_catch_up(time);
 	pcm_catch_up(time);
-	hash = take(&sound.fm_buffer, (time + FM_PERIOD - 1) / FM_PERIOD, hash, 0);
-	sound.frame_hash = take(&sound.pcm_buffer, (time + PCM_PERIOD - 1) / PCM_PERIOD, hash, 1);
+	take(&sound.fm_buffer, (time + FM_PERIOD - 1) / FM_PERIOD, 0);
+	take(&sound.pcm_buffer, (time + PCM_PERIOD - 1) / PCM_PERIOD, 1);
+	sound.frame_hash_due = true;
 	mix();
 }
 
+/* Worked out when it is asked for: a port that plays the sound never asks, and it is 13,000 bytes a frame */
 uint64_t sound_chips_frame_hash(void)
 {
+	if (sound.frame_hash_due)
+	{
+		const uint64_t hash = hash_samples(sound.frame[0], sound.frame_counts[0], 0xcbf29ce484222325ull);
+
+		sound.frame_hash = hash_samples(sound.frame[1], sound.frame_counts[1], hash);
+		sound.frame_hash_due = false;
+	}
 	return sound.frame_hash;
 }
 
@@ -339,6 +425,7 @@ void sound_chips_attach(void)
 	s32_fm_init(&sound.fm);
 	multipcm_init(&sound.pcm, S32_MULTIPCM_CLOCK, s32_pcm_sample_read);
 	multipcm_reset(&sound.pcm);
+	pcm_take_image();
 	sound.fm_samples = sound.pcm_samples = 0;
 	sound.fm_buffer.first = sound.pcm_buffer.first = 0;
 	s32_board.chips.fm_read = fm_read;

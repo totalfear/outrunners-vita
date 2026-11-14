@@ -21,6 +21,12 @@
  *
  *    Levels are logarithmic until the last step: an envelope or a sine is an attenuation, attenuations
  *    add, and one ROM turns the sum into a linear volume.
+ *
+ *    A chip that plays nothing still costs 24 operators a sample, so the refresh also notes the channels
+ *    that are dormant: released, fully attenuated, no SSG-EG, a phase step of their own. Until the next
+ *    refresh such a channel's sample is its four phases moving on, and while all six are dormant
+ *    s32_fm_generate_many() makes a whole run of samples at once. OutRunners uses the chip for its timers
+ *    only, so that is every sample it asks for.
  */
 #include "s32/ym3438.h"
 
@@ -439,10 +445,12 @@ static void start_release(s32_fm_operator *op)
 	}
 }
 
-/* The refresh of an operator: its values, and its key. Whether it may still be heard. */
+/* The refresh of an operator: its values, and its key. Whether it may still be heard. The values are
+   what the registers alone make of it: with no register changed since the last refresh they stand. */
 static bool refresh_operator(const s32_fm *chip, const s32_fm_channel *channel, s32_fm_operator *op)
 {
-	refresh_values(chip, channel, op);
+	if (chip->registers_changed)
+		refresh_values(chip, channel, op);
 
 	const uint8_t key = op->keys != 0;
 
@@ -635,6 +643,24 @@ static bool refresh_channel(const s32_fm *chip, s32_fm_channel *channel)
 	return heard;
 }
 
+/* An operator clock_operator() only moves the phase of: its envelope is at the bottom of the release,
+   where a step leaves it (0x3FF plus anything is cut back to 0x3FF), SSG-EG does not touch it, and its
+   phase step does not follow the LFO. Only a refresh changes any of that: every register write and
+   every key asks for one. */
+static bool operator_dormant(const s32_fm *chip, const s32_fm_operator *op)
+{
+	return op->stage == S32_FM_RELEASE && op->attenuation == 0x3ff && !ssg_enabled(chip, op) && op->ssg_inverted == 0
+		&& op->step != STEP_FOLLOWS_LFO;
+}
+
+static bool channel_dormant(const s32_fm *chip, const s32_fm_channel *channel)
+{
+	for (int index = 0; index < 4; index++)
+		if (!operator_dormant(chip, &channel->operators[index]))
+			return false;
+	return true;
+}
+
 /* ---- the core ---- */
 
 /* The LFO's step of a sample: it sets the AM, and gives the PM (-7 to 7) */
@@ -676,9 +702,15 @@ static void clock_chip(s32_fm *chip)
 	if (chip->modified_channels != 0 || chip->refresh_count++ >= 4096)
 	{
 		chip->active_channels = 0;
+		chip->dormant_channels = 0;
 		for (int index = 0; index < S32_FM_CHANNELS; index++)
+		{
 			if (refresh_channel(chip, &chip->channels[index]))
 				chip->active_channels |= 1u << index;
+			if (channel_dormant(chip, &chip->channels[index]))
+				chip->dormant_channels |= 1u << index;
+		}
+		chip->registers_changed = 0;
 		chip->modified_channels = 0;
 		chip->refresh_count = 0;
 	}
@@ -695,8 +727,62 @@ static void clock_chip(s32_fm *chip)
 
 		channel->feedback[0] = channel->feedback[1];
 		channel->feedback[1] = channel->feedback_next;
+		if (chip->dormant_channels & (1u << index))
+		{
+			for (int op = 0; op < 4; op++)
+				channel->operators[op].phase += channel->operators[op].step;
+			continue;
+		}
 		for (int op = 0; op < 4; op++)
 			clock_operator(chip, channel, &channel->operators[op], chip->envelope_counter, lfo_pm);
+	}
+}
+
+/* How many of the next 'count' samples move nothing but the phases, the LFO and the counters, and so are
+   all the same: those up to the next refresh, while every channel is dormant */
+static int dormant_run(const s32_fm *chip, int count)
+{
+	if (chip->modified_channels != 0 || chip->dormant_channels != ALL_CHANNELS || chip->active_channels != 0)
+		return 0;
+	if (chip->refresh_count >= 4096 || field(chip->envelope_counter, 0, 2) == 3)
+		return 0;
+	return (uint32_t)count < 4096 - chip->refresh_count ? count : (int)(4096 - chip->refresh_count);
+}
+
+/* 'count' samples of clock_chip() in a dormant run */
+static void clock_dormant(s32_fm *chip, uint32_t count)
+{
+	/* the envelope counter's low two bits count 0, 1, 2: three samples a whole step */
+	const uint32_t thirds = field(chip->envelope_counter, 0, 2) + count;
+
+	chip->total_clocks = (uint8_t)(chip->total_clocks + count);
+	chip->refresh_count += count;
+	chip->envelope_counter = ((chip->envelope_counter >> 2) + thirds / 3) << 2 | thirds % 3;
+	for (uint32_t sample = 0; sample < count; sample++)
+		clock_lfo(chip);
+	for (int index = 0; index < S32_FM_CHANNELS; index++)
+	{
+		s32_fm_channel *channel = &chip->channels[index];
+
+		/* operator 1's last two outputs: after two samples both are the one it last made */
+		for (uint32_t sample = 0; sample < count && sample < 2; sample++)
+		{
+			channel->feedback[0] = channel->feedback[1];
+			channel->feedback[1] = channel->feedback_next;
+		}
+		for (int op = 0; op < 4; op++)
+			channel->operators[op].phase += channel->operators[op].step * count;
+	}
+}
+
+/* A register takes a value: a new one means the operators' values have to be worked out again (the
+   program rearms timer A at every tick with the mode it already has: 24 operators' values for nothing) */
+static void set_register(s32_fm *chip, uint32_t number, uint8_t data)
+{
+	if (chip->registers[number] != data)
+	{
+		chip->registers[number] = data;
+		chip->registers_changed = 1;
 	}
 }
 
@@ -707,7 +793,7 @@ static void write_mode(s32_fm *chip, uint8_t data)
 	uint8_t clear = 0;
 
 	chip->modified_channels = ALL_CHANNELS;
-	chip->registers[REG_MODE] = data;
+	set_register(chip, REG_MODE, data);
 	if (field(data, 5, 1))
 		clear |= STATUS_TIMER_B;
 	if (field(data, 4, 1))
@@ -736,11 +822,11 @@ static void write_register(s32_fm *chip, uint32_t number, uint8_t data)
 		const uint32_t latch = 0xb8 | field(number, 3, 1);
 
 		if (field(number, 2, 1))
-			chip->registers[latch] = data & 0x3f;
+			set_register(chip, latch, data & 0x3f);
 		else
 		{
-			chip->registers[number] = data;
-			chip->registers[number | 4] = chip->registers[latch];
+			set_register(chip, number, data);
+			set_register(chip, number | 4, chip->registers[latch]);
 		}
 		return;
 	}
@@ -748,7 +834,7 @@ static void write_register(s32_fm *chip, uint32_t number, uint8_t data)
 	if ((number & 0xf8) == 0xb8)
 		return;
 
-	chip->registers[number] = data;
+	set_register(chip, number, data);
 	if (number == REG_KEY)
 	{
 		uint32_t channel = field(data, 0, 2);
@@ -802,6 +888,7 @@ void s32_fm_reset(s32_fm *chip)
 {
 	change_status(chip, 0, 0xff);
 	memset(chip->registers, 0, sizeof(chip->registers));
+	chip->registers_changed = 1;
 
 	/* every channel to both outputs */
 	chip->registers[0xb4] = chip->registers[0xb5] = chip->registers[0xb6] = 0xc0;
@@ -921,4 +1008,39 @@ void s32_fm_generate(s32_fm *chip, int32_t out[2])
 	/* the chip sends the channels one after the other: their average, to 16 bits */
 	out[0] = out[0] * 128 / 6;
 	out[1] = out[1] * 128 / 6;
+}
+
+void s32_fm_generate_many(s32_fm *chip, int32_t *out, int count)
+{
+	while (count > 0)
+	{
+		const int run = dormant_run(chip, count);
+		int32_t sample[2] = { 0, 0 };
+
+		if (run == 0)
+		{
+			s32_fm_generate(chip, out);
+			out += 2;
+			count--;
+			continue;
+		}
+		clock_dormant(chip, (uint32_t)run);
+
+		/* no channel is heard: the DAC alone, as s32_fm_generate() has it */
+		if (chip->dac_enable)
+		{
+			const int32_t dac = sign_extend(chip->dac_data, 9);
+
+			sample[0] = chip_register(chip, 0x1b6, 7, 1) ? dac : 0;
+			sample[1] = chip_register(chip, 0x1b6, 6, 1) ? dac : 0;
+		}
+		sample[0] = sample[0] * 128 / 6;
+		sample[1] = sample[1] * 128 / 6;
+		for (int index = 0; index < run; index++)
+		{
+			*out++ = sample[0];
+			*out++ = sample[1];
+		}
+		count -= run;
+	}
 }

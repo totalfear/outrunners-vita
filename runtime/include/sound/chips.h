@@ -33,6 +33,10 @@ void sound_cpu_attach(void);
 /* The YM3438 timers due by 'time' run out (sound_cpu.c calls it where a block starts) */
 void sound_chips_timers_due(uint64_t time);
 
+/* When the next YM3438 timer runs out, board cycles: UINT64_MAX with none running. A write to the chip or
+   a timer running out changes it. */
+uint64_t sound_chips_next_timer(void);
+
 /* The MultiPCM makes the samples due by now, before the board changes its banks */
 void sound_chips_pcm_banks_changing(void);
 

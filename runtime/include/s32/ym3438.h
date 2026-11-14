@@ -98,7 +98,9 @@ typedef struct s32_fm
 	uint8_t timer_running[2];
 	uint8_t total_clocks;            /* samples made, low 8 bits (timer B's first period is short by the low 4) */
 	uint32_t active_channels;        /* channels that may be heard, as the last refresh found them */
+	uint32_t dormant_channels;       /* ... and those whose operators only turn their phases until the next */
 	uint32_t modified_channels;      /* channels whose registers changed since the last refresh */
+	uint8_t registers_changed;       /* a register took a new value since then: the operators' values are old */
 	uint32_t refresh_count;          /* samples since the last refresh: one every 4097 catches ending notes */
 	s32_fm_channel channels[S32_FM_CHANNELS];
 } s32_fm;
@@ -118,6 +120,10 @@ void s32_fm_timer_expired(s32_fm *chip, int timer);
 
 /* The next sample: left and right */
 void s32_fm_generate(s32_fm *chip, int32_t out[2]);
+
+/* The next 'count' samples, the left and right of each in turn: s32_fm_generate()'s, sample for sample,
+   with the runs in which nothing can be heard and no envelope moves made at once */
+void s32_fm_generate_many(s32_fm *chip, int32_t *out, int count);
 
 #ifdef __cplusplus
 }

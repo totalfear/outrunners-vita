@@ -479,69 +479,108 @@ static int32_t clamp(int32_t value)
 	return value < -32768 ? -32768 : (value > 32767 ? 32767 : value);
 }
 
-void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count)
+void multipcm_map(multipcm *chip, int page, const uint8_t *data)
 {
+	chip->pages[page & (MULTIPCM_PAGES - 1)] = data;
+}
+
+/* A byte of the sample ROM: in the page the host mapped, or through its 'read' */
+static inline uint8_t sample_byte(const multipcm *chip, uint32_t address)
+{
+	const uint8_t *page = chip->pages[(address >> MULTIPCM_PAGE_BITS) & (MULTIPCM_PAGES - 1)];
+
+	return page ? page[address & ((1u << MULTIPCM_PAGE_BITS) - 1)] : chip->read(address);
+}
+
+/* The voice's next 'count' samples, added to the two outputs: its last one is the one its release ends on.
+   What does not change while it plays is read once, and its place, level and last sample are kept here
+   until the end: the outputs are 32-bit values like the voice's own, so the compiler would read every
+   field again after each sample otherwise. */
+static void voice_generate(multipcm *chip, multipcm_voice *voice, int32_t *left, int32_t *right, int count)
+{
+	const uint32_t start = voice->start;
+	const uint32_t end = voice->end;
+	const uint32_t loop_span = (voice->end - voice->loop) << TL_SHIFT;
+	const uint32_t voice_step = voice->step;
+	const uint32_t pan = voice->pan << 7;
+	const uint32_t dest_total_level = voice->dest_total_level;
+	const uint32_t total_level_step = (uint32_t)voice->total_level_step;
+	const bool twelve_bits = (voice->format & 4) != 0;
+	const bool vibrato = voice->vibrato != 0;
+	const bool tremolo = voice->tremolo != 0;
+	uint32_t offset = voice->offset;
+	uint32_t total_level = voice->total_level;
+	int32_t prev_sample = voice->prev_sample;
+	bool reverse = voice->reverse;
+
 	for (int i = 0; i < count; ++i)
 	{
-		int32_t smpl = 0;
-		int32_t smpr = 0;
+		const uint32_t vol = (total_level >> TL_SHIFT) | pan;
+		const int32_t fpart = (int32_t)(offset & ((1 << TL_SHIFT) - 1));
+		uint32_t spos = offset >> TL_SHIFT;
+		uint32_t step = voice_step;
+		int32_t csample;
+		int32_t sample;
 
-		for (int index = 0; index < MULTIPCM_VOICES; ++index)
+		if (reverse)
+			spos = end - spos - 1;
+		if (twelve_bits)    /* 12 bits: three bytes hold two samples */
 		{
-			multipcm_voice *voice = &chip->voices[index];
-			uint32_t vol;
-			uint32_t spos;
-			uint32_t step;
-			int32_t csample;
-			int32_t fpart;
-			int32_t sample;
+			const uint32_t address = start + (spos >> 1) * 3;
 
-			if (!voice->playing)
-				continue;
-			vol = (voice->total_level >> TL_SHIFT) | (voice->pan << 7);
-			spos = voice->offset >> TL_SHIFT;
-			step = voice->step;
-			fpart = (int32_t)(voice->offset & ((1 << TL_SHIFT) - 1));
-			if (voice->reverse)
-				spos = voice->end - spos - 1;
-			if (voice->format & 4)    /* 12 bits: three bytes hold two samples */
-			{
-				const uint32_t address = voice->start + (spos >> 1) * 3;
-
-				if (!(spos & 1))
-					csample = (int16_t)(chip->read(address & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf) << 4);
-				else
-					csample = (int16_t)(chip->read((address + 2) & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf0));
-			}
+			if (!(spos & 1))
+				csample = (int16_t)(sample_byte(chip, address & 0x3fffff) << 8 | (sample_byte(chip, (address + 1) & 0x3fffff) & 0xf) << 4);
 			else
-				csample = (int16_t)(chip->read((voice->start + spos) & 0x3fffff) << 8);
-
-			sample = (csample * fpart + voice->prev_sample * ((1 << TL_SHIFT) - fpart)) >> TL_SHIFT;
-			if (voice->vibrato)
-			{
-				step = step * (uint32_t)lfo_step(&voice->pitch_lfo);
-				step >>= TL_SHIFT;
-			}
-			voice->offset += step;
-			if (spos ^ (voice->offset >> TL_SHIFT))
-				voice->prev_sample = csample;
-			if (voice->offset >= (voice->end << TL_SHIFT))
-			{
-				voice->offset -= (voice->end - voice->loop) << TL_SHIFT;
-				voice->reverse = false;
-			}
-			if ((voice->total_level >> TL_SHIFT) != voice->dest_total_level)
-				voice->total_level += (uint32_t)voice->total_level_step;
-			if (voice->tremolo)
-			{
-				sample = sample * lfo_step(&voice->amplitude_lfo);
-				sample >>= TL_SHIFT;
-			}
-			sample = (sample * envelope_update(voice)) >> 10;
-			smpl += (tables.left_pan[vol] * sample) >> TL_SHIFT;
-			smpr += (tables.right_pan[vol] * sample) >> TL_SHIFT;
+				csample = (int16_t)(sample_byte(chip, (address + 2) & 0x3fffff) << 8 | (sample_byte(chip, (address + 1) & 0x3fffff) & 0xf0));
 		}
-		left[i] = clamp(smpl);
-		right[i] = clamp(smpr);
+		else
+			csample = (int16_t)(sample_byte(chip, (start + spos) & 0x3fffff) << 8);
+
+		sample = (csample * fpart + prev_sample * ((1 << TL_SHIFT) - fpart)) >> TL_SHIFT;
+		if (vibrato)
+		{
+			step = step * (uint32_t)lfo_step(&voice->pitch_lfo);
+			step >>= TL_SHIFT;
+		}
+		offset += step;
+		if (spos ^ (offset >> TL_SHIFT))
+			prev_sample = csample;
+		if (offset >= (end << TL_SHIFT))
+		{
+			offset -= loop_span;
+			reverse = false;
+		}
+		if ((total_level >> TL_SHIFT) != dest_total_level)
+			total_level += total_level_step;
+		if (tremolo)
+		{
+			sample = sample * lfo_step(&voice->amplitude_lfo);
+			sample >>= TL_SHIFT;
+		}
+		sample = (sample * envelope_update(voice)) >> 10;
+		left[i] += (tables.left_pan[vol] * sample) >> TL_SHIFT;
+		right[i] += (tables.right_pan[vol] * sample) >> TL_SHIFT;
+		if (!voice->playing)
+			break;
+	}
+	voice->offset = offset;
+	voice->total_level = total_level;
+	voice->prev_sample = prev_sample;
+	voice->reverse = reverse;
+}
+
+/* Voice by voice, each one's samples added to the outputs in the voices' order: a voice's samples depend on
+   nothing but the voice, so the sums are those of taking the samples one by one, every voice in each */
+void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count)
+{
+	memset(left, 0, (size_t)count * sizeof(*left));
+	memset(right, 0, (size_t)count * sizeof(*right));
+	for (int index = 0; index < MULTIPCM_VOICES; ++index)
+		if (chip->voices[index].playing)
+			voice_generate(chip, &chip->voices[index], left, right, count);
+	for (int i = 0; i < count; ++i)
+	{
+		left[i] = clamp(left[i]);
+		right[i] = clamp(right[i]);
 	}
 }

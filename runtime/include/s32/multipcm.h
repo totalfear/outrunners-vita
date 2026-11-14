@@ -27,6 +27,8 @@ extern "C" {
 #endif
 
 #define MULTIPCM_VOICES 28
+#define MULTIPCM_PAGE_BITS 19    /* multipcm_map(): the 22 bits of address as 8 pages of 512 KB */
+#define MULTIPCM_PAGES 8
 
 typedef struct multipcm_lfo
 {
@@ -85,6 +87,7 @@ typedef struct multipcm_voice
 typedef struct multipcm
 {
 	uint8_t (*read)(uint32_t address);    /* a byte of the sample ROM, 22 bits of address */
+	const uint8_t *pages[MULTIPCM_PAGES]; /* the pages the host mapped (multipcm_map), or NULL */
 	float rate;                           /* samples a second */
 	multipcm_voice voices[MULTIPCM_VOICES];
 	int current_voice;
@@ -94,6 +97,11 @@ typedef struct multipcm
 /* A chip on 'clock' (Hz) reading its samples through 'read'; keys off */
 void multipcm_init(multipcm *chip, uint32_t clock, uint8_t (*read)(uint32_t address));
 void multipcm_reset(multipcm *chip);
+
+/* Optional: where the host has page 'page' of the sample ROM (512 KB, the bytes 'read' gives for it), so
+   that the voices take their samples there with no call a byte; NULL takes the page back to 'read'. A host
+   that banks the ROM maps again when the bank changes, after it made the samples due before. */
+void multipcm_map(multipcm *chip, int page, const uint8_t *data);
 
 /* The bus: offset 0 writes the register 'address' picks of the voice offset 1 picked, offset 2 picks the
    register; the chip reads back 0 */
