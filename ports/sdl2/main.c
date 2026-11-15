@@ -615,6 +615,9 @@ static void present(SDL_Rect source)
 	console_side_map_wanted(map_room_there);    /* (and between them the route map, from the game's next frame) */
 #endif
 	SDL_SetTextureScaleMode(texture, kind == 2 ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+	/* (the clear is in the draw colour: black, not the yellow the frame counter left it, the bars at the
+	   picture's sides on the Vita's screen) */
+	SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 	SDL_RenderClear(renderer);
 	if (kind == 1 || kind == 3)
 	{

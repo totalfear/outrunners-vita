@@ -270,8 +270,9 @@ jobs:
           edit("window", re.compile(r"defined\(\s*__vita__\s*\)[^#]{0,300}?SDL_CreateWindow", re.S),
           '''#elif defined(ORUNNERS_HANDHELD)
           	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''','''#elif defined(__vita__)
-          	/* (the Vita's screen, 960 x 544: the system shows the window as all of it) */
-          	window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);
+          	/* (the Vita's screen, 960 x 544: the system shows the window as all of it; made already for the loading screen) */
+          	if (!window)
+          		window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);
           #elif defined(ORUNNERS_HANDHELD)
           	window = SDL_CreateWindow(TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_FULLSCREEN_DESKTOP);''')
 
@@ -424,8 +425,7 @@ jobs:
           ''','''#ifdef __vita__
           	/* SDL lists the Vita's GLES2 renderer before its GXM one, and the GLES2 one compiles its shaders as it runs,
           	   with libshacccg.suprx: a file of the Vita's firmware that not every setup has (and Vita3K has not). The GXM
-          	   renderer has its shaders built in and needs nothing */
-          	renderer = NULL;
+          	   renderer has its shaders built in and needs nothing. (The loading screen made both already: kept) */
           	for (int driver = 0; window && !renderer && driver < SDL_GetNumRenderDrivers(); driver++)
           	{
           		SDL_RendererInfo driver_info;
@@ -440,6 +440,122 @@ jobs:
           	renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
           #endif
           ''')
+
+          # --- the loading screen and the picture's shape (Vita only) ---
+          # The Vita showed nothing between the LiveArea and the game's first frame while the assets pack was read
+          # and the sound's samples copied. The window and the renderer are made first now, and OUTRUNNERS /
+          # LOADING shown on them, in blocks of a small font of their own (nothing of the game's is loaded yet)
+          edit("loading screen", 'vita_loading_screen',
+          """/* VSYNC: the renderer shows each frame at the screen's refresh, unless the frames run as fast as they can""",
+          """#ifdef __vita__
+          /* 5 x 5 letters, a row each, its high bit (16) the left */
+          static const char vita_letters[] = "ADEGILNORSTU.";
+          static const uint8_t vita_letter_rows[][5] = {
+          	{ 14, 17, 31, 17, 17 }, { 30, 17, 17, 17, 30 }, { 31, 16, 30, 16, 31 }, { 15, 16, 23, 17, 15 },
+          	{ 31, 4, 4, 4, 31 }, { 16, 16, 16, 16, 31 }, { 17, 25, 21, 19, 17 }, { 14, 17, 17, 17, 14 },
+          	{ 30, 17, 30, 20, 19 }, { 15, 16, 14, 1, 30 }, { 31, 4, 4, 4, 4 }, { 17, 17, 17, 17, 14 },
+          	{ 0, 0, 0, 0, 4 } };
+
+          /* 'text' in the letters above, 'size' pixels a block, its middle at 'middle_y', across the middle */
+          static void vita_words(const char *text, int size, int middle_y, Uint8 red, Uint8 green, Uint8 blue)
+          {
+          	SDL_Rect blocks[25 * 16];
+          	const int length = (int)SDL_strlen(text);
+          	int count = 0;
+          	int x = (960 - (length * 6 - 1) * size) / 2;
+
+          	for (const char *letter = text; *letter && count + 25 <= (int)SDL_arraysize(blocks); letter++, x += 6 * size)
+          	{
+          		const char *at = SDL_strchr(vita_letters, *letter);
+
+          		if (!at || *letter == ' ')
+          			continue;
+          		for (int row = 0; row < 5; row++)
+          			for (int column = 0; column < 5; column++)
+          				if (vita_letter_rows[at - vita_letters][row] & (16 >> column))
+          					blocks[count++] = (SDL_Rect){ x + column * size, middle_y - 5 * size / 2 + row * size, size, size };
+          	}
+          	SDL_SetRenderDrawColor(renderer, red, green, blue, 255);
+          	SDL_RenderFillRects(renderer, blocks, count);
+          }
+
+          /* The window and the renderer, made before the assets are read (the GXM renderer, as below), and the
+             loading screen on them: it stays until the game's first frame */
+          static void vita_loading_screen(void)
+          {
+          	window = SDL_CreateWindow(TITLE, 0, 0, 960, 544, SDL_WINDOW_SHOWN);
+          	for (int driver = 0; window && !renderer && driver < SDL_GetNumRenderDrivers(); driver++)
+          	{
+          		SDL_RendererInfo driver_info;
+
+          		if (SDL_GetRenderDriverInfo(driver, &driver_info) == 0 && driver_info.name
+          			&& (SDL_strstr(driver_info.name, "gxm") || SDL_strstr(driver_info.name, "GXM")))
+          			renderer = SDL_CreateRenderer(window, driver, 0);
+          	}
+          	if (!renderer)
+          		return;    /* (made again below, as before, and no loading screen) */
+          	SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+          	SDL_RenderClear(renderer);
+          	vita_words("OUTRUNNERS", 12, 230, 255, 200, 0);
+          	vita_words("LOADING...", 5, 330, 255, 255, 255);
+          	SDL_RenderPresent(renderer);
+          	fprintf(stderr, "loading screen: shown\\n");
+          }
+          #endif
+
+          /* VSYNC: the renderer shows each frame at the screen's refresh, unless the frames run as fast as they can""")
+
+          edit("loading screen shown", 'vita_loading_screen();',
+          """	saves = saves_folder();
+          """, """#ifdef __vita__
+          	vita_loading_screen();    /* (before the assets are read: they take a while) */
+          #endif
+          	saves = saves_folder();
+          """)
+
+          # The picture: WIDE 16:9 (398 of the video's 416 columns at 224 rows: the Vita's 960 x 544 is about
+          # 16:9), filling the screen where 4:3 left black at its sides, and smooth pixels. Two small files in the
+          # game's folder change them: wide.txt 0 the game's 4:3; pixels.txt 0 sharp, 1 smooth, 2 bilinear, 3 CRT
+          edit("picture files", 'wide.txt',
+          """#else
+          	console_window_settings.wide = WIDE_OFF;
+          #endif
+          	console_window_settings.pixels = PIXELS_SMOOTH;""",
+          """#elif defined(__vita__)
+          	{
+          		static int vita_wide = -1, vita_pixels = PIXELS_SMOOTH;
+
+          		if (vita_wide < 0)
+          		{
+          			static const char *const kinds[PIXELS_KINDS] = { "sharp", "smooth", "bilinear", "CRT" };
+          			int value;
+          			FILE *file = fopen(VITA_FOLDER "/wide.txt", "r");
+
+          			vita_wide = 1;
+          			if (file)
+          			{
+          				if (fscanf(file, "%d", &value) == 1)
+          					vita_wide = value != 0;
+          				fclose(file);
+          			}
+          			file = fopen(VITA_FOLDER "/pixels.txt", "r");
+          			if (file)
+          			{
+          				if (fscanf(file, "%d", &value) == 1 && value >= 0 && value < PIXELS_KINDS)
+          					vita_pixels = value;
+          				fclose(file);
+          			}
+          			fprintf(stderr, "picture: %s, %s pixels\\n", vita_wide ? "16:9" : "4:3", kinds[vita_pixels]);
+          		}
+          		console_window_settings.wide = vita_wide ? WIDE_16_9 : WIDE_OFF;
+          		console_window_settings.pixels = vita_pixels;
+          	}
+          #else
+          	console_window_settings.wide = WIDE_OFF;
+          #endif
+          #ifndef __vita__
+          	console_window_settings.pixels = PIXELS_SMOOTH;
+          #endif""")
 
           edit("frame skip variable", 'static int vita_frame_skip;',
           """#ifdef ORUNNERS_HANDHELD
@@ -779,17 +895,9 @@ jobs:
           		pace_frames = 0;""")
 
 
-          edit("sharp pixels", 'PIXELS_SHARP',
-          '''	console_window_settings.pixels = PIXELS_SMOOTH;
-          	console_window_settings.vertical = false;''','''#ifdef __vita__
-          	/* SMOOTH draws the picture a second time, into a render target of its own, and the GXM driver ends and
-          	   begins a scene of its own for it: on the Vita a whole extra pass a frame costs more than soft edges
-          	   are worth (OPTIONS > VIDEO still offers them) */
-          	console_window_settings.pixels = PIXELS_SHARP;
-          #else
-          	console_window_settings.pixels = PIXELS_SMOOTH;
-          #endif
-          	console_window_settings.vertical = false;''')
+          # (the Vita's pixels: "picture files" above. SMOOTH draws the picture a second time, into a render target
+          # of its own, a pass the GXM driver ends and begins a scene for: SHARP was the Vita's for that while
+          # the frame had no time to spare; at 960 x 544, 2.4 times the game's pixels, sharp ones come out uneven)
 
 
           edit("timing sprites", 'sprites_due_timed',
