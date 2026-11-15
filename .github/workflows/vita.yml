@@ -1379,6 +1379,17 @@ jobs:
           		case PAGE_VIDEO: video_frame(pressed); break;
           #endif""")
 
+          # The pages' backdrop on the Vita: black, not the see-through shadow. A shadow over the whole screen
+          # is drawn and mixed the long way, a pixel at a time (the Vita's log: the picture's rows 4.0 -> 7.8 ms,
+          # the sprites 1 -> 4.3 ms, OPTIONS at 45 frames a second); a black one takes the short way
+          edit("console/menu.c", "the Vita's pages on black", 'console_black(-side, 0, SCREEN_WIDTH + 2 * side, 224)',
+          """	console_shade(-side, 0, SCREEN_WIDTH + 2 * side, 224);""",
+          """#ifdef __vita__
+          	console_black(-side, 0, SCREEN_WIDTH + 2 * side, 224);    /* (the Vita's pages on black: a shadow costs it 15 frames a second) */
+          #else
+          	console_shade(-side, 0, SCREEN_WIDTH + 2 * side, 224);
+          #endif""")
+
           failed = False
           for path, edits in FILES.items():
               s = open(path, encoding="utf-8", newline="").read()
