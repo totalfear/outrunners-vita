@@ -546,7 +546,7 @@ jobs:
           # 16:9), filling the screen where 4:3 left black at its sides, and bilinear pixels (one pass on the GPU:
           # smooth's extra pass cost about 3.7 ms a frame and the race dropped to 48-57 fps). The Vita has
           # OPTIONS > VIDEO (console/menu.c, the edits below): PIXELS, WIDE (16:9 or the game's 4:3), AUDIO PITCH
-          # and LOW LAG, kept in outrunners.ini with the rest of OPTIONS. Here the picture is only held to what
+          # and ZERO INPUT LAG, kept in outrunners.ini with the rest of OPTIONS. Here the picture is only held to what
           # the Vita can show: WIDE 16:9 or off
           edit("picture from options", 'OPTIONS > VIDEO on the Vita',
           """#else
@@ -580,7 +580,7 @@ jobs:
           #endif""")
 
           # What the Vita starts with before outrunners.ini has said otherwise (a first start): 16:9, bilinear,
-          # the sound's cushion, and the overlap (LOW LAG off)
+          # the sound's cushion, and ZERO INPUT LAG (no overlap)
           edit("options defaults", "the Vita's own defaults",
           """	snprintf(settings_path, sizeof(settings_path), "%s" FILE_NAME ".ini", saves ? saves : "");
           	load_window_settings();""",
@@ -590,7 +590,7 @@ jobs:
           	console_window_settings.wide = WIDE_16_9;
           	console_window_settings.pixels = PIXELS_BILINEAR;
           	console_window_settings.sound_cushion = true;
-          	console_window_settings.low_lag = false;
+          	console_window_settings.low_lag = true;    /* (ZERO INPUT LAG: on unless the player turned it off) */
           #endif
           	load_window_settings();""")
 
@@ -599,7 +599,7 @@ jobs:
           	fclose(output);""",
           """		settings->centring, settings->vibration, settings->phone_vibration, settings->both_radios);
           #ifdef __vita__
-          	fprintf(output, "sound_cushion=%d\\nlow_lag=%d\\n", settings->sound_cushion, settings->low_lag);
+          	fprintf(output, "sound_cushion=%d\\nzero_lag=%d\\n", settings->sound_cushion, settings->low_lag);
           #endif
           	fclose(output);""")
 
@@ -608,7 +608,7 @@ jobs:
           """#ifdef __vita__
           		else if (sscanf(line, "sound_cushion=%d", &number) == 1)
           			settings->sound_cushion = number != 0;
-          		else if (sscanf(line, "low_lag=%d", &number) == 1)
+          		else if (sscanf(line, "zero_lag=%d", &number) == 1)
           			settings->low_lag = number != 0;
           #endif
           		else if (sscanf(line, "pixels=%31s", text) == 1)""")
@@ -633,7 +633,7 @@ jobs:
           # lists the board sends go to the workers the same way. The picture is ended when the next VBLANK
           # starts, core 0 taking what rows are left, and shown then: a frame costs about the larger of the two
           # rather than their sum, and the picture reaches the screen one VBLANK later than it did.
-          # OPTIONS > VIDEO > LOW LAG turns it off from the next start (the frame is then drawn and shown as it was)
+          # OPTIONS > VIDEO > ZERO INPUT LAG turns it off from the next start (the frame is then drawn and shown as it was)
           edit("overlap variables", 'static bool vita_overlap',
           """/* The frames drawn into the window */
           static void show_screens(void)
@@ -642,7 +642,7 @@ jobs:
           static bool vita_frame_begun;       /* a frame's video is begun, and not shown yet */
           static bool vita_begin_wanted;      /* on_frame_shown: show_screens begins this frame's video once the texture has the last one */
           static uint64_t vita_begin_time;    /* what beginning it took, for the log's "its video" */
-          bool orunners_vita_low_lag_started; /* LOW LAG as the game started with it (console/menu.c: a change is for the next start) */
+          bool orunners_vita_low_lag_started; /* ZERO INPUT LAG as the game started with it (console/menu.c: a change is for the next start) */
 
           /* The stutter's test: the screen's refreshes (sceDisplayGetVcount) between one picture sent and the next. One
              is right; two or more, a picture held on the screen (a stutter); none, two sent in one refresh, the first
@@ -652,6 +652,27 @@ jobs:
           static unsigned vita_held, vita_held_most, vita_unseen, vita_held_after_log;
           static bool vita_log_just_written;     /* the log went to the card since the last picture */
           static double vita_log_write_ms;       /* what its last write took */
+
+          /* The frames' pace on the Vita: the screen's own refresh, not the game's clock (wait_for_frame). The two
+             are both 60 a second, but not in step: where a picture went out just past a refresh it was shown for
+             two and the next one not at all, a few times a second for a while (the stutter's test above said so,
+             a third of the time). So a frame begins at a refresh: a picture each. A frame that ran past its refresh
+             is not waited for, so the next one catches up; far behind (a stage loading), the count starts over */
+          static void vita_wait_for_refresh(void)
+          {
+          	static unsigned target;
+          	static bool started;
+          	const unsigned now = (unsigned)sceDisplayGetVcount();
+
+          	if (!started || (int)(now - target) > 15)
+          	{
+          		target = now;
+          		started = true;
+          	}
+          	target++;
+          	while ((int)(target - (unsigned)sceDisplayGetVcount()) > 0)
+          		sceDisplayWaitVblankStart();
+          }
           #endif
 
           /* The frames drawn into the window */
@@ -803,18 +824,19 @@ jobs:
           					half_columns = value != 0;
           				fclose(file);
           			}
-          			/* OPTIONS > VIDEO > LOW LAG (low_lag=1 in outrunners.ini, read here: the workers start before
+          			/* OPTIONS > VIDEO > ZERO INPUT LAG (zero_lag in outrunners.ini, on unless 0, read here: the workers start before
           			   the settings are loaded): the frame's video drawn and waited for when VBLANK starts, a frame
           			   less of lag. Otherwise a frame's video is drawn on the workers' threads while the game runs
           			   its next frame (s32_video_set_overlap, and on_frame_shown): with no such threads there is
           			   nothing to gain */
+          			orunners_vita_low_lag_started = true;    /* (ZERO INPUT LAG unless outrunners.ini says zero_lag=0) */
           			file = fopen(VITA_FOLDER "/" FILE_NAME ".ini", "r");
           			if (file)
           			{
           				char line[128];
 
           				while (fgets(line, sizeof(line), file))
-          					if (sscanf(line, "low_lag=%d", &value) == 1)
+          					if (sscanf(line, "zero_lag=%d", &value) == 1)
           						orunners_vita_low_lag_started = value != 0;
           				fclose(file);
           			}
@@ -824,7 +846,7 @@ jobs:
           			if (s32_workers_count() == 0)
           				vita_overlap = false;
           			s32_video_set_overlap(vita_overlap);
-          			fprintf(stderr, "frameskip: %d, half columns: %s, overlap: %s (LOW LAG %s)\\n", vita_frame_skip,
+          			fprintf(stderr, "frameskip: %d, half columns: %s, overlap: %s (ZERO INPUT LAG %s)\\n", vita_frame_skip,
           				half_columns ? "yes" : "no", vita_overlap ? "yes" : "no", orunners_vita_low_lag_started ? "on" : "off");
           			if (vita_overlap)
           				fprintf(stderr, "overlap: a frame's video is drawn on the workers while the game runs the next frame. In the lines below "
@@ -915,9 +937,12 @@ jobs:
           		wait_for_frame();""",
           """#ifdef __vita__
           	pace_extras += SDL_GetPerformanceCounter() - done_start;
-          #endif
           	if (!fast)
-          		wait_for_frame();""")
+          		vita_wait_for_refresh();    /* (the screen's refresh, not the game's clock: a picture each) */
+          #else
+          	if (!fast)
+          		wait_for_frame();
+          #endif""")
 
           edit("timing log", 'waiting %.1f',
           """pace_start = now;
@@ -1110,7 +1135,7 @@ jobs:
           # --- OPTIONS > VIDEO on the Vita (console/console.h, console/menu.c) ------------------------------------
           # A handheld build has no VIDEO page (its picture fixed). The Vita's has one of its own: PIXELS, WIDE
           # (16:9 or the game's 4:3), AUDIO PITCH (AUTO: the sound's 150 ms cushion, kept by nudging the pitch up
-          # to 2%; EXACT: the board's own pitch, a gap if the game falls behind) and LOW LAG (no overlap: a frame
+          # to 2%; EXACT: the board's own pitch, a gap if the game falls behind) and ZERO INPUT LAG (no overlap: a frame
           # less between the buttons and the screen, from the next start). Kept in outrunners.ini (main.c, above)
           python3 - <<'OPTIONS_EDITS'
           import re, sys
@@ -1132,7 +1157,7 @@ jobs:
           """	bool changed;
           #ifdef __vita__
           	bool sound_cushion;    /* OPTIONS > VIDEO > AUDIO PITCH (the Vita's): AUTO, the sound's cushion kept by nudging the pitch up to 2% (false: EXACT) */
-          	bool low_lag;          /* OPTIONS > VIDEO > LOW LAG (the Vita's): no overlap, a frame less of lag, from the next start */
+          	bool low_lag;          /* OPTIONS > VIDEO > ZERO INPUT LAG (the Vita's): no overlap, a frame less of lag, from the next start */
           #endif
           } console_window;""")
 
@@ -1165,10 +1190,10 @@ jobs:
           edit("console/menu.c", "the Vita's VIDEO page", 'static void vita_video_frame(uint32_t pressed)',
           """/* A force's value on STEERING: its percent, OFF at 0 */""",
           """#ifdef __vita__
-          extern bool orunners_vita_low_lag_started;    /* (ports/sdl2/main.c: LOW LAG as the game started) */
+          extern bool orunners_vita_low_lag_started;    /* (ports/sdl2/main.c: ZERO INPUT LAG as the game started) */
 
-          /* The Vita's VIDEO: PIXELS, WIDE (16:9 or the game's 4:3), AUDIO PITCH and LOW LAG. The picture and the
-             pitch change at once; LOW LAG at the next start (the overlap is set up as the game starts) */
+          /* The Vita's VIDEO: PIXELS, WIDE (16:9 or the game's 4:3), AUDIO PITCH and ZERO INPUT LAG. The picture and the
+             pitch change at once; ZERO INPUT LAG at the next start (the overlap is set up as the game starts) */
           static void vita_video_frame(uint32_t pressed)
           {
           	console_window *window = &console_window_settings;
@@ -1208,11 +1233,10 @@ jobs:
           	line(VITA_PIXELS, "PIXELS", value);
           	line(VITA_WIDE, "WIDE", window->wide == WIDE_OFF ? "< 4:3 >" : "< 16:9 >");
           	line(VITA_PITCH, "AUDIO PITCH", window->sound_cushion ? "< AUTO >" : "< EXACT >");
-          	if (window->low_lag == orunners_vita_low_lag_started)
-          		line(VITA_LOW_LAG, "LOW LAG", window->low_lag ? "< ON >" : "< OFF >");
-          	else
-          		line(VITA_LOW_LAG, "LOW LAG", window->low_lag ? "< ON NEXT START >" : "< OFF NEXT START >");
+          	line(VITA_LOW_LAG, "ZERO INPUT LAG", window->low_lag ? "< ON >" : "< OFF >");
           	line(VITA_BACK, "BACK", NULL);
+          	if (window->low_lag != orunners_vita_low_lag_started)
+          		line_at(VITA_BACK + 1, false, "RESTART TO APPLY", NULL);
           	darken_page();
           }
           #endif
