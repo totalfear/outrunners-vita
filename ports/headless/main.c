@@ -3,16 +3,16 @@
  *    Description: runs the game with no screen or sound, with the controls a script drives, and writes a
  *                 hash of the board state (and of the frames the video draws) after every frame, in the
  *                 format tools/core/system32/reference/s32ref uses
- *    Version:     0.1.1
+ *    Version:     0.1.2
  *    Created:     11-10-2026
- *    Modified:    07-11-2026
+ *    Modified:    14-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
  *    Usage: orunners_headless [--frames N] [--hashes FILE] [--script FILE] [--dump-frame N --dump-dir DIR]
  *                             [--video-hashes FILE] [--video-dump N ... --video-dir DIR] [--sound-hashes FILE]
  *                             [--sprite-census FILE] [--tile-census FILE] [--memory-census FILE]
- *                             [--assets FOLDER]
+ *                             [--assets FOLDER] [--workers N] [--overlap]
  *    The game's data is its assets (game/assets.h), the files extract_assets.py writes: --assets, or the
  *    folder 'assets' beside the executable, or the one in the current folder (a run from the repository).
  *    The scaffold (ORUNNERS_SCAFFOLD) runs the original code, so it reads the ROM set in rom/ instead.
@@ -28,6 +28,10 @@
  *    (s32_video_show_screens): the right one keeps its first frame.
  *    --memory-census writes what memory each mem_read and mem_write of the game's C reached, by its line
  *    (runtime/src/memory_census.c), in a build with ORUNNERS_MEMORY_CENSUS (tools/memory_census.py).
+ *    --overlap draws each frame as a port with cores to spare does (s32_video_set_overlap): begun when VBLANK
+ *    starts, drawn on the --workers threads while the game runs the next frame, ended when the next VBLANK
+ *    starts. The hashes and the dumps are the same, each frame's written when its picture is done; with
+ *    --workers 0 every picture is drawn after the game's next frame has run.
  */
 #include "s32/bus.h"
 #include "s32/machine.h"
@@ -63,7 +67,7 @@
 #define USAGE "Usage: orunners_headless [--frames N] [--hashes FILE] [--script FILE] [--dump-frame N --dump-dir DIR]" \
 	" [--video-hashes FILE] [--video-dump N ... --video-dir DIR] [--sound-hashes FILE]" \
 	" [--sprite-census FILE] [--tile-census FILE] [--memory-census FILE] [--assets FOLDER|PACK.assets]" \
-	" [--write-pack PACK.assets] [--workers N] [--screens 1|2] [--half-columns] [--sound-wav FILE]" \
+	" [--write-pack PACK.assets] [--workers N] [--overlap] [--screens 1|2] [--half-columns] [--sound-wav FILE]" \
 	" (orunners_console_headless: [--actions FILE] [--wide | --wide-20-9 | --wide-16-10] [--autopilot]" \
 	" [--ghost-folder DIR] [--pause-dump N] [--side-map] [--real-time] [--name NAME] [--network-log FRAMES]" \
 	" [--restart N])\n"
@@ -81,6 +85,9 @@ static FILE *video_hashes;
 static uint64_t video_dumps[MAX_VIDEO_DUMPS];
 static int video_dump_count;
 static const char *video_dir;
+static bool overlap;                 /* --overlap: a frame's picture is drawn while the game runs the next frame */
+static uint64_t frames_waiting[16];  /* the frames that ended since the picture was begun: written when it is done */
+static int frames_waiting_count;
 #ifdef ORUNNERS_CONSOLE
 static uint64_t pause_dump_frame;    /* --pause-dump: the frame drawn with the pause's words over it */
 static bool real_time;               /* --real-time: 60 frames a second, as a window's (two games on the network) */
@@ -314,14 +321,53 @@ static void network_frame(void)
 }
 #endif
 
+/* What the end of frame 'frame' does with the picture: its hash, and the BMP where one was asked for */
+static void write_picture(uint64_t frame)
+{
+	if (video_hashes)
+		fprintf(video_hashes, "%" PRIu64 " %016" PRIx64 "\n", frame, s32_video_frame_hash());
+	for (int index = 0; index < video_dump_count && video_dir; index++)
+		if (video_dumps[index] == frame)
+		{
+			char path[1024];
+
+			snprintf(path, sizeof(path), "%s/frame_%" PRIu64 ".bmp", video_dir, video_dumps[index]);
+			write_bmp(path);
+		}
+}
+
+/* --overlap: the picture begun is done, and the frames that ended meanwhile have theirs */
+static void end_picture(void)
+{
+	s32_video_draw_frame_end();
+	for (int index = 0; index < frames_waiting_count; index++)
+		write_picture(frames_waiting[index]);
+	frames_waiting_count = 0;
+}
+
+/* --overlap: VBLANK starts. The picture begun a frame ago is ended and this frame's begun: the workers draw it
+   while the game runs the next frame */
+static void on_frame_shown_overlap(void)
+{
+	end_picture();
+	s32_video_draw_frame_begin();
+}
+
 static void on_frame_done(void)
 {
 	if (hashes)
 		fprintf(hashes, "%" PRIu64 " %016" PRIx64 "\n", program_frames() - 1, s32_state_hash());
 	if (dump_dir && program_frames() - 1 == dump_frame)
 		dump_state();
-	if (video_hashes)
-		fprintf(video_hashes, "%" PRIu64 " %016" PRIx64 "\n", program_frames() - 1, s32_video_frame_hash());
+	if (overlap)
+	{
+		/* (the picture is still being drawn: this frame's hash is written when it is done) */
+		if (frames_waiting_count == (int)(sizeof(frames_waiting) / sizeof(frames_waiting[0])))
+			end_picture();
+		frames_waiting[frames_waiting_count++] = program_frames() - 1;
+	}
+	else
+		write_picture(program_frames() - 1);
 	if (sound_hashes || sound_wav)
 	{
 		/* the sound board up to the frame's end, then the samples that start before it */
@@ -340,14 +386,6 @@ static void on_frame_done(void)
 				sound_wav_bytes += (uint32_t)fwrite(mix, sizeof(int16_t) * 2, count, sound_wav) * 4u;
 		}
 	}
-	for (int index = 0; index < video_dump_count && video_dir; index++)
-		if (video_dumps[index] == program_frames() - 1)
-		{
-			char path[1024];
-
-			snprintf(path, sizeof(path), "%s/frame_%" PRIu64 ".bmp", video_dir, video_dumps[index]);
-			write_bmp(path);
-		}
 #ifdef ORUNNERS_CONSOLE
 	if (pause_dump_frame && pause_dump_frame == program_frames() - 1 && video_dir)
 	{
@@ -355,6 +393,8 @@ static void on_frame_done(void)
 		static uint8_t list[0x1000];
 		char path[1024];
 
+		if (overlap)
+			end_picture();    /* (the frame's own picture first: the pause's is drawn over it) */
 		s32_video_overlay_sprites(list, console_pause_sprites(list, sizeof(list), CONSOLE_PAUSE_QUIT));
 		s32_video_draw_frame();
 		snprintf(path, sizeof(path), "%s/pause_%" PRIu64 ".bmp", video_dir, pause_dump_frame);
@@ -518,6 +558,8 @@ int main(int argc, char **argv)
 			s32_workers_start(atoi(argv[++index]));    /* (the video's rows on that many more threads) */
 		else if (strcmp(argv[index], "--half-columns") == 0)
 			s32_video_set_half_columns(true);    /* (every other column worked out, as a slow device's port asks) */
+		else if (strcmp(argv[index], "--overlap") == 0)
+			overlap = true;
 		else if (strcmp(argv[index], "--screens") == 0 && index + 1 < argc)
 			screens = atoi(argv[++index]);
 #ifdef ORUNNERS_CONSOLE
@@ -654,6 +696,14 @@ int main(int argc, char **argv)
 		s32_video_init_graphics(assets_graphics());
 #endif
 	s32_video_show_screens(screens == 1 ? 1 : 3);
+	if (overlap && s32_board.frame_shown == s32_video_draw_frame)
+	{
+		/* (the frames in two halves, the game's next frame between them) */
+		s32_video_set_overlap(true);
+		s32_board.frame_shown = on_frame_shown_overlap;
+	}
+	else
+		overlap = false;    /* (no video: nothing to draw) */
 	if (sound_hashes_path || sound_wav)
 	{
 #ifdef ORUNNERS_SCAFFOLD
@@ -678,6 +728,8 @@ int main(int argc, char **argv)
 
 	program_run();
 
+	if (overlap)
+		end_picture();    /* (the last frame's) */
 	if (hashes)
 		fclose(hashes);
 	if (video_hashes)
