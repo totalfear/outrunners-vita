@@ -1684,7 +1684,26 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build build/vita --target OutRunners.vpk -- -v 2>&1 | tee build.log
+          # vita-elf-create puts its own data (the module's info, the imports' stubs: a few KB) at the end of the
+          # code's segment, and stops with "segment 1 overlaps" where the code ends too close below the data's
+          # page: a matter of the code's size alone, any change can bring it. When it does, a few KB of constant
+          # padding go into the code (ports/vita/vita_runtime.c) and it is linked again, until it fits
+          set +e
+          for pad in 0 4096 8192 12288 16384; do
+            if [ "$pad" != 0 ]; then
+              echo "=== the code's segment ends too close to the data's: $pad bytes of padding, and again"
+              sed -i '/VITA_LAYOUT_PAD/d' ports/vita/vita_runtime.c
+              echo "const unsigned char vita_layout_pad[$pad] __attribute__((used, aligned(4))) = { 1 };    /* VITA_LAYOUT_PAD (the CI's Build step) */" >> ports/vita/vita_runtime.c
+            fi
+            cmake --build build/vita --target OutRunners.vpk -- -v > build_try.log 2>&1
+            status=$?
+            cat build_try.log >> build.log
+            cat build_try.log
+            if [ $status -eq 0 ] || ! grep -q "segment 1 overlaps" build_try.log; then
+              break
+            fi
+          done
+          exit $status
 
       - name: Count the divide libcalls left in the build
         run: |
