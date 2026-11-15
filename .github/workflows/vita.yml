@@ -293,18 +293,22 @@ jobs:
           static int16_t resample_last[2];     /* the last sample of the frame before */
           static bool resample_going;          /* resample_last holds one */
 
-          /* The game runs below 60 a second, so it makes less than a second of mix in a second and the
-             device runs dry: that is the chopping. Rather than let it gap, the mix is stretched to fill the
-             time, by nudging the resampler's step to keep a few frames of sound in the queue. It comes out
-             low -- which is what slow motion should sound like -- but it is continuous, and the pitch
-             follows the frame rate back up as the frame rate improves. stretch.txt 0 turns it off. */
+          /* A cushion of sound in the queue, about 150 ms. The game makes one frame of mix a frame, so a single
+             long frame (the log shows one of about 120 ms now and then) would empty a short queue and gap. With
+             the cushion it is taken up without a sound. The queue is brought back to the cushion by running the
+             resampler at most 2% slow or 1% fast (a third of a semitone at the most, which the ear does not
+             hear move), and gently, so it never warbles. When the queue does run dry -- the game stalled for
+             longer than the cushion -- that is a short gap, and the cushion is put back as silence, rather than
+             the music sliding down in pitch. (It used to be stretched up to three times slow to fill any gap:
+             a slide of more than an octave, and seconds to come back.) stretch.txt 0: no nudging at all */
           static bool resample_stretch = true;
           static uint32_t resample_step;       /* 16.16, nudged each frame; 0 until the first one */
+          #define RESAMPLE_CUSHION_FRAMES 9u   /* 9 frames of 1/60 s: 150 ms */
 
           static void queue_resampled(const int16_t *samples, size_t frames)
           {
-          	/* a frame of the mix is about 926 samples, which make about 800 at the board's own pitch -- but
-          	   stretched to the limit below they make about 2400, so there is room for three times that */
+          	/* a frame of the mix is about 926 samples, which make about 800 at the board's own pitch, and 2%
+          	   slow about 816: room to spare */
           	static int16_t out[8192];
           	const size_t room = sizeof(out) / sizeof(out[0]) / 2;
           	const uint32_t base = (uint32_t)(((uint64_t)sound_chips_mix_rate() << 16) / RESAMPLE_RATE);
@@ -313,22 +317,47 @@ jobs:
           	uint32_t phase = resample_phase;
           	size_t made = 0;
 
+          	const Uint32 cushion = frame_bytes * RESAMPLE_CUSHION_FRAMES;
+          	const Uint32 queued = SDL_GetQueuedAudioSize(audio);
+
           	if (resample_step == 0)
           		resample_step = base;
+          	if (queued == 0)
+          	{
+          		/* the device has run dry (or this is the first frame): the gap has happened; put the cushion
+          		   back as silence so the next long frame does not gap too */
+          		static const int16_t quiet[2048];
+          		Uint32 left = cushion;
+
+          		while (left > 0)
+          		{
+          			const Uint32 bytes = left < sizeof(quiet) ? left : (Uint32)sizeof(quiet);
+
+          			SDL_QueueAudio(audio, quiet, bytes);
+          			left -= bytes;
+          		}
+          	}
           	if (resample_stretch)
           	{
-          		/* a smaller step means more samples out of the same mix: the sound stretches and drops in
-          		   pitch. A 1/256 nudge a frame moves about 0.4% at a time, slow enough not to warble */
-          		const Uint32 queued = SDL_GetQueuedAudioSize(audio);
+          		/* a smaller step means more samples out of the same mix (the queue fills, the pitch drops a
+          		   hair), a larger one fewer. The step is aimed at 2% slow when the queue is under half the
+          		   cushion, 1% slow under the cushion, 1% fast over it by three frames, else the board's own,
+          		   and moves toward that by 1/2048 a frame (1% in about 20 frames: no warble) */
+          		uint32_t aim = base;
+          		const uint32_t move = base / 2048u + 1u;
 
-          		if (queued < frame_bytes * 3u)
-          			resample_step -= resample_step / 256u;
-          		else if (queued > frame_bytes * 6u)
-          			resample_step += resample_step / 256u;
-          		if (resample_step < base / 3u)
-          			resample_step = base / 3u;    /* (three times slower at the very most) */
-          		if (resample_step > base)
-          			resample_step = base;         /* (never faster than the board's own pitch) */
+          		if (queued < cushion / 2u)
+          			aim = base - base / 50u;
+          		else if (queued < cushion)
+          			aim = base - base / 100u;
+          		else if (queued > cushion + frame_bytes * 3u)
+          			aim = base + base / 100u;
+          		if (resample_step + move < aim)
+          			resample_step += move;
+          		else if (resample_step > aim + move)
+          			resample_step -= move;
+          		else
+          			resample_step = aim;
           	}
           	else
           		resample_step = base;
@@ -737,7 +766,7 @@ jobs:
           			if (s32_workers_count() == 0)
           				vita_overlap = false;
           			s32_video_set_overlap(vita_overlap);
-          			fprintf(stderr, "frameskip: %d, audio stretched to fill: %s, half columns: %s, overlap: %s\\n", vita_frame_skip,
+          			fprintf(stderr, "frameskip: %d, sound kept at its cushion (150 ms, pitch within 2%%): %s, half columns: %s, overlap: %s\\n", vita_frame_skip,
           				resample_stretch ? "yes" : "no", half_columns ? "yes" : "no", vita_overlap ? "yes" : "no");
           			if (vita_overlap)
           				fprintf(stderr, "overlap: a frame's video is drawn on the workers while the game runs the next frame. In the lines below "
