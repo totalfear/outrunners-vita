@@ -558,18 +558,20 @@ jobs:
           	if (console_window_settings.wide != WIDE_OFF)
           		console_window_settings.wide = WIDE_16_9;
           	{
-          		static int logged_wide = -1, logged_pixels = -1, logged_pitch = -1;
+          		static int logged_wide = -1, logged_pixels = -1, logged_pitch = -1, logged_blend = -1;
 
           		if (logged_wide != console_window_settings.wide || logged_pixels != console_window_settings.pixels
-          			|| logged_pitch != (int)console_window_settings.sound_cushion)
+          			|| logged_pitch != (int)console_window_settings.sound_cushion
+          			|| logged_blend != (int)console_window_settings.crt_blend)
           		{
           			static const char *const kinds[PIXELS_KINDS] = { "sharp", "smooth", "bilinear", "CRT" };
 
           			logged_wide = console_window_settings.wide;
           			logged_pixels = console_window_settings.pixels;
           			logged_pitch = console_window_settings.sound_cushion;
-          			fprintf(stderr, "picture: %s, %s pixels; audio pitch %s\\n", logged_wide == WIDE_OFF ? "4:3" : "16:9",
-          				kinds[logged_pixels], logged_pitch ? "auto (a 150 ms cushion, within 2%)" : "exact");
+          			logged_blend = console_window_settings.crt_blend;
+          			fprintf(stderr, "picture: %s, %s pixels, CRT blend %s; audio pitch %s\\n", logged_wide == WIDE_OFF ? "4:3" : "16:9",
+          				kinds[logged_pixels], logged_blend ? "on" : "off", logged_pitch ? "auto (a 150 ms cushion, within 2%)" : "exact");
           		}
           	}
           #else
@@ -591,6 +593,7 @@ jobs:
           	console_window_settings.pixels = PIXELS_BILINEAR;
           	console_window_settings.sound_cushion = true;
           	console_window_settings.low_lag = true;    /* (ZERO INPUT LAG: on unless the player turned it off) */
+          	console_window_settings.crt_blend = true;  /* (CRT BLEND: what the game shows every other frame, half seen, as on the cabinet's screen) */
           #endif
           	load_window_settings();""")
 
@@ -599,7 +602,8 @@ jobs:
           	fclose(output);""",
           """		settings->centring, settings->vibration, settings->phone_vibration, settings->both_radios);
           #ifdef __vita__
-          	fprintf(output, "sound_cushion=%d\\nzero_lag=%d\\n", settings->sound_cushion, settings->low_lag);
+          	fprintf(output, "sound_cushion=%d\\nzero_lag=%d\\ncrt_blend=%d\\n", settings->sound_cushion, settings->low_lag,
+          		settings->crt_blend);
           #endif
           	fclose(output);""")
 
@@ -610,6 +614,8 @@ jobs:
           			settings->sound_cushion = number != 0;
           		else if (sscanf(line, "zero_lag=%d", &number) == 1)
           			settings->low_lag = number != 0;
+          		else if (sscanf(line, "crt_blend=%d", &number) == 1)
+          			settings->crt_blend = number != 0;
           #endif
           		else if (sscanf(line, "pixels=%31s", text) == 1)""")
 
@@ -1020,6 +1026,92 @@ jobs:
           		pace_start = now;
           		pace_frames = 0;""")
 
+          # CRT BLEND (the Vita's, OPTIONS > VIDEO, on unless turned off): the game shows some things every other
+          # frame (the road's forks, the falls' spray), which a cabinet's CRT, its glow fading slowly, showed as
+          # half seen; an LCD or OLED shows them blinking. Each picture is shown half and half with the one before
+          # it (the frame's texture and the last frame's, swapped at each frame: no copy), one more quad drawn
+          edit("blend textures", 'vita_previous',
+          """static SDL_Texture *scaled;""",
+          """static SDL_Texture *scaled;
+          #ifdef __vita__
+          static SDL_Texture *vita_previous;      /* CRT BLEND: the last frame's picture (show_screens swaps it with the texture) */
+          static unsigned vita_blend_frames;      /* the frames swapped in since CRT BLEND went on (two before the last one is real) */
+
+          static bool vita_blending(void)
+          {
+          	return vita_previous && console_window_settings.crt_blend && vita_blend_frames >= 2;
+          }
+
+          /* the picture 'from' of the frame into 'to': the last frame's whole, this one's at half over it */
+          static void vita_blend_copy(const SDL_Rect *from, const SDL_Rect *to)
+          {
+          	SDL_ScaleMode mode = SDL_ScaleModeNearest;
+
+          	SDL_GetTextureScaleMode(texture, &mode);
+          	SDL_SetTextureScaleMode(vita_previous, mode);    /* (as the frame's: PIXELS) */
+          	SDL_SetTextureBlendMode(vita_previous, SDL_BLENDMODE_NONE);
+          	SDL_RenderCopy(renderer, vita_previous, from, to);
+          	SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+          	SDL_SetTextureAlphaMod(texture, 128);
+          	SDL_RenderCopy(renderer, texture, from, to);
+          	SDL_SetTextureAlphaMod(texture, 255);
+          }
+          #endif""")
+
+          edit("blend made", 'vita_previous = SDL_CreateTexture',
+          """	SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+          	apply_vsync();""",
+          """	SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+          #ifdef __vita__
+          	vita_previous = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+          		2 * S32_VIDEO_MAX_WIDTH, 2 * S32_VIDEO_HEIGHT);    /* (CRT BLEND's last frame) */
+          #endif
+          	apply_vsync();""")
+
+          edit("blend swap", 'the last frame kept for CRT BLEND',
+          """	SDL_Rect source = { 0, 0, 0, 0 };
+          	const int shown = screens_shown();""",
+          """	SDL_Rect source = { 0, 0, 0, 0 };
+          	const int shown = screens_shown();
+          #ifdef __vita__
+          	if (vita_previous && console_window_settings.crt_blend)
+          	{
+          		/* (the last frame kept for CRT BLEND: the texture it went into is the one before now) */
+          		SDL_Texture *const last = texture;
+
+          		texture = vita_previous;
+          		vita_previous = last;
+          		if (vita_blend_frames < 2)
+          			vita_blend_frames++;
+          	}
+          	else
+          		vita_blend_frames = 0;
+          #endif""")
+
+          edit("blend scaled", 'vita_blend_copy(&source, &whole)',
+          """			SDL_RenderCopy(renderer, texture, &source, &whole);""",
+          """#ifdef __vita__
+          			if (vita_blending())
+          				vita_blend_copy(&source, &whole);
+          			else
+          #endif
+          			SDL_RenderCopy(renderer, texture, &source, &whole);""")
+
+          edit("blend direct", 'vita_blend_copy(&from[0], &shown[0])',
+          """		for (int picture = 0; picture < pictures; picture++)
+          			SDL_RenderCopyEx(renderer, texture, &from[picture], &shown[picture], picture == 1 ? 180.0 : 0.0, NULL,
+          				SDL_FLIP_NONE);""",
+          """#ifdef __vita__
+          	if (vita_blending())
+          	{
+          		vita_blend_copy(&from[0], &shown[0]);    /* (the Vita's one picture) */
+          	}
+          	else
+          #endif
+          		for (int picture = 0; picture < pictures; picture++)
+          			SDL_RenderCopyEx(renderer, texture, &from[picture], &shown[picture], picture == 1 ? 180.0 : 0.0, NULL,
+          				SDL_FLIP_NONE);""")
+
           # The log was written to the card a line at a time (and at every report): a write to the card may hold a
           # frame. It is kept in memory and written every 30 seconds now (six reports), the write timed
           edit("log every 30 s", 'reports_since_write',
@@ -1158,6 +1250,7 @@ jobs:
           #ifdef __vita__
           	bool sound_cushion;    /* OPTIONS > VIDEO > AUDIO PITCH (the Vita's): AUTO, the sound's cushion kept by nudging the pitch up to 2% (false: EXACT) */
           	bool low_lag;          /* OPTIONS > VIDEO > ZERO INPUT LAG (the Vita's): no overlap, a frame less of lag, from the next start */
+          	bool crt_blend;        /* OPTIONS > VIDEO > CRT BLEND (the Vita's): each picture half and half with the one before */
           #endif
           } console_window;""")
 
@@ -1176,7 +1269,7 @@ jobs:
           	VIDEO_ITEMS };
           #ifdef __vita__
           /* the Vita's VIDEO: its picture, its sound's pitch and its lag (vita_video_frame) */
-          enum { VITA_PIXELS, VITA_WIDE, VITA_PITCH, VITA_LOW_LAG, VITA_BACK, VITA_VIDEO_ITEMS };
+          enum { VITA_PIXELS, VITA_WIDE, VITA_CRT_BLEND, VITA_PITCH, VITA_LOW_LAG, VITA_BACK, VITA_VIDEO_ITEMS };
           #endif""")
 
           edit("console/menu.c", "the Vita's VIDEO count", 'return VITA_VIDEO_ITEMS;',
@@ -1212,6 +1305,10 @@ jobs:
           				window->wide = window->wide == WIDE_OFF ? WIDE_16_9 : WIDE_OFF;
           				window->changed = true;
           				break;
+          			case VITA_CRT_BLEND:
+          				window->crt_blend = !window->crt_blend;
+          				window->changed = true;
+          				break;
           			case VITA_PITCH:
           				window->sound_cushion = !window->sound_cushion;
           				window->changed = true;
@@ -1232,6 +1329,7 @@ jobs:
           	snprintf(value, sizeof(value), "< %s >", pixel_kinds[window->pixels]);
           	line(VITA_PIXELS, "PIXELS", value);
           	line(VITA_WIDE, "WIDE", window->wide == WIDE_OFF ? "< 4:3 >" : "< 16:9 >");
+          	line(VITA_CRT_BLEND, "CRT BLEND", window->crt_blend ? "< ON >" : "< OFF >");
           	line(VITA_PITCH, "AUDIO PITCH", window->sound_cushion ? "< AUTO >" : "< EXACT >");
           	line(VITA_LOW_LAG, "ZERO INPUT LAG", window->low_lag ? "< ON >" : "< OFF >");
           	line(VITA_BACK, "BACK", NULL);
