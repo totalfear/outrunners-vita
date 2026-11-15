@@ -643,6 +643,15 @@ jobs:
           static bool vita_begin_wanted;      /* on_frame_shown: show_screens begins this frame's video once the texture has the last one */
           static uint64_t vita_begin_time;    /* what beginning it took, for the log's "its video" */
           bool orunners_vita_low_lag_started; /* LOW LAG as the game started with it (console/menu.c: a change is for the next start) */
+
+          /* The stutter's test: the screen's refreshes (sceDisplayGetVcount) between one picture sent and the next. One
+             is right; two or more, a picture held on the screen (a stutter); none, two sent in one refresh, the first
+             never seen (a stutter too: the game keeps its own 60 a second, the screen its own rate). And the log's
+             writes to the card, timed, now every 30 seconds (log_pace) */
+          #include <psp2/display.h>
+          static unsigned vita_held, vita_held_most, vita_unseen, vita_held_after_log;
+          static bool vita_log_just_written;     /* the log went to the card since the last picture */
+          static double vita_log_write_ms;       /* what its last write took */
           #endif
 
           /* The frames drawn into the window */
@@ -670,7 +679,30 @@ jobs:
           		vita_begin_time = SDL_GetPerformanceCounter() - begin_start;
           	}
           #endif
-          	present(source);""")
+          	present(source);
+          #ifdef __vita__
+          	{
+          		/* (the stutter's test: the refreshes since the last picture sent) */
+          		static unsigned last_vcount;
+          		static bool counting;
+          		const unsigned vcount = (unsigned)sceDisplayGetVcount();
+          		const unsigned refreshes = vcount - last_vcount;
+
+          		if (counting && refreshes >= 2)
+          		{
+          			vita_held++;
+          			if (refreshes > vita_held_most)
+          				vita_held_most = refreshes;
+          			if (vita_log_just_written)
+          				vita_held_after_log++;
+          		}
+          		else if (counting && refreshes == 0)
+          			vita_unseen++;
+          		vita_log_just_written = false;
+          		last_vcount = vcount;
+          		counting = true;
+          	}
+          #endif""")
 
           edit("overlap frame", 'vita_frame_begun = vita_begin_wanted = !skipped;',
           """	s32_video_draw_frame();
@@ -945,10 +977,54 @@ jobs:
           			(double)pace_sprites * per_frame,
           			((double)pace_work - (double)pace_video - (double)pace_showing - (double)pace_controls
           				- (double)pace_sprites) * per_frame);
+          		{
+          			/* (the stutter's test, show_screens: the screen's own rate, and the pictures it did not show one refresh each) */
+          			static unsigned window_vcount;
+          			const unsigned vcount = (unsigned)sceDisplayGetVcount();
+
+          			if (window_vcount)
+          				fprintf(stderr, "  screen: %.2f refreshes a second; pictures held 2+ refreshes %u (the longest %u, %u of them "
+          					"just after the log went to the card), sent twice in one refresh %u; the log's last write %.1f ms\\n",
+          					(double)(vcount - window_vcount) * (double)frequency / (double)(now - pace_start),
+          					vita_held, vita_held_most, vita_held_after_log, vita_unseen, vita_log_write_ms);
+          			window_vcount = vcount;
+          			vita_held = vita_held_most = vita_unseen = vita_held_after_log = 0;
+          		}
           		pace_controls = pace_sound = pace_queue = pace_extras = pace_sprites = 0;
           #endif
           		pace_start = now;
           		pace_frames = 0;""")
+
+          # The log was written to the card a line at a time (and at every report): a write to the card may hold a
+          # frame. It is kept in memory and written every 30 seconds now (six reports), the write timed
+          edit("log every 30 s", 'reports_since_write',
+          """		fflush(stderr);    /* (not to the card at once: a write to it would hold a frame) */""",
+          """#ifdef __vita__
+          		{
+          			static int reports_since_write;
+
+          			if (++reports_since_write >= 6)
+          			{
+          				const uint64_t write_start = SDL_GetPerformanceCounter();
+
+          				reports_since_write = 0;
+          				fflush(stderr);
+          				vita_log_write_ms = 1000.0 * (double)(SDL_GetPerformanceCounter() - write_start) / (double)frequency;
+          				vita_log_just_written = true;
+          			}
+          		}
+          #else
+          		fflush(stderr);    /* (not to the card at once: a write to it would hold a frame) */
+          #endif""")
+
+          edit("log in memory", 'vita_log_buffer',
+          """	setvbuf(stderr, NULL, _IOLBF, 0);    /* (a line at a time: the last one before a crash is the one that counts) */""",
+          """	{
+          		/* (kept in memory and written to the card every 30 seconds, log_pace: a write to the card may hold a frame) */
+          		static char vita_log_buffer[64 << 10];
+
+          		setvbuf(stderr, vita_log_buffer, _IOFBF, sizeof(vita_log_buffer));
+          	}""")
 
 
           # (the Vita's pixels: "picture files" above. SMOOTH draws the picture a second time, into a render target
