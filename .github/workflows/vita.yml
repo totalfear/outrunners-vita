@@ -649,6 +649,7 @@ jobs:
           static bool vita_begin_wanted;      /* on_frame_shown: show_screens begins this frame's video once the texture has the last one */
           static uint64_t vita_begin_time;    /* what beginning it took, for the log's "its video" */
           bool orunners_vita_low_lag_started; /* ZERO INPUT LAG as the game started with it (console/menu.c: a change is for the next start) */
+          int orunners_vita_log_timing;       /* timing.txt in the game's folder: the frames' timing in the log every 5 seconds (else the log is quiet) */
 
           /* The stutter's test: the screen's refreshes (sceDisplayGetVcount) between one picture sent and the next. One
              is right; two or more, a picture held on the screen (a stutter); none, two sent in one refresh, the first
@@ -1112,6 +1113,22 @@ jobs:
           			SDL_RenderCopyEx(renderer, texture, &from[picture], &shown[picture], picture == 1 ? 180.0 : 0.0, NULL,
           				SDL_FLIP_NONE);""")
 
+          edit("quiet log", 'if (!orunners_vita_log_timing)',
+          """	if (!work_done)
+          	{
+          		frame_start = now;
+          		return;
+          	}""",
+          """	if (!work_done)
+          	{
+          		frame_start = now;
+          		return;
+          	}
+          #ifdef __vita__
+          	if (!orunners_vita_log_timing)
+          		return;    /* (the frames' timing only with timing.txt: the log is quiet) */
+          #endif""")
+
           # The log was written to the card a line at a time (and at every report): a write to the card may hold a
           # frame. It is kept in memory and written every 30 seconds now (six reports), the write timed
           edit("log every 30 s", 'reports_since_write',
@@ -1137,10 +1154,22 @@ jobs:
           edit("log in memory", 'vita_log_buffer',
           """	setvbuf(stderr, NULL, _IOLBF, 0);    /* (a line at a time: the last one before a crash is the one that counts) */""",
           """	{
-          		/* (kept in memory and written to the card every 30 seconds, log_pace: a write to the card may hold a frame) */
-          		static char vita_log_buffer[64 << 10];
+          		/* The log is quiet: what the game found as it started, what it was set to, and what went wrong, a line
+          		   at a time (the last one before a crash is the one that counts). timing.txt in the game's folder adds
+          		   the frames' timing every 5 seconds (log_pace), kept in memory and written to the card every 30
+          		   seconds: a write to the card may hold a frame */
+          		FILE *timing = fopen(VITA_FOLDER "/timing.txt", "r");
 
-          		setvbuf(stderr, vita_log_buffer, _IOFBF, sizeof(vita_log_buffer));
+          		orunners_vita_log_timing = timing != NULL;
+          		if (timing)
+          		{
+          			static char vita_log_buffer[64 << 10];
+
+          			fclose(timing);
+          			setvbuf(stderr, vita_log_buffer, _IOFBF, sizeof(vita_log_buffer));
+          		}
+          		else
+          			setvbuf(stderr, NULL, _IOLBF, 0);
           	}""")
 
 
@@ -1511,7 +1540,8 @@ jobs:
           # What the switch counts (in the log, once a second: "task switches: N in M ms"). It is put into the
           # Vita's host_task_switch whether that was just added or was in the sources already
           COUNTER_CODE = r"""	{
-          		/* VITA_TASK_COUNTER: how many task switches the game makes, in the log once a second */
+          		/* VITA_TASK_COUNTER: how many task switches the game makes, in the log once a second (with timing.txt) */
+          		extern int orunners_vita_log_timing;    /* (ports/sdl2/main.c) */
           		static unsigned long switch_count;
           		static long long switch_last;
 
@@ -1524,7 +1554,8 @@ jobs:
           			now = tv.tv_sec * 1000000LL + tv.tv_usec;
           			if (now - switch_last >= 1000000)
           			{
-          				fprintf(stderr, "task switches: %lu in %lld ms\n", switch_count, (now - switch_last) / 1000);
+          				if (orunners_vita_log_timing)
+          					fprintf(stderr, "task switches: %lu in %lld ms\n", switch_count, (now - switch_last) / 1000);
           				switch_count = 0;
           				switch_last = now;
           			}
