@@ -1208,21 +1208,12 @@ jobs:
           done, problems = [], []
 
           # --- 1. the sprite erase ---
-          # s32_video_sprites erases the sprite buffer of EVERY screen, 218 KB each and a pixel at a time, while
-          # draw_sprite already leaves a screen the port does not show alone: erasing that one is work for nothing.
-          # The Vita shows one screen, so this saves 218 KB of writes a frame, and what is left is a memset
-          ERASE = re.compile(r"(?m)^[ \t]*for \(size_t index = 0; index < \(size_t\)HEIGHT \* WIDTH; index\+\+\)\n[ \t]*shown\[index\] = 0xffff;\n")
-          ERASE_NEW = ("\t\t\tif (!bit((uint32_t)video.screens_shown, screen))\n"
-                       "\t\t\t\tcontinue;    /* (a screen the port does not show: draw_sprite leaves its sprites alone too) */\n"
-                       "\t\t\tmemset(shown, 0xff, (size_t)HEIGHT * WIDTH * sizeof(shown[0]));    /* (0xffff a pixel: no sprite there) */\n")
-
-          if "draw_sprite leaves its sprites alone too" in s:
-              done.append("sprite erase: already in")
-          elif len(ERASE.findall(s)) != 1:
-              problems.append("sprite erase: the loop was found %d times (wanted 1)" % len(ERASE.findall(s)))
+          # (no longer an edit: the source's own erase, erase_sprite_rows, is of the columns drawn on alone, so
+          # a screen the port does not show has nothing to erase, and what is erased is a memset a row)
+          if "static void erase_sprite_rows(" in s:
+              done.append("sprite erase: the source's own")
           else:
-              s = ERASE.sub(lambda m: ERASE_NEW, s, count=1)
-              done.append("sprite erase: added")
+              problems.append("sprite erase: erase_sprite_rows was found 0 times (wanted 1)")
 
           # --- 3. splitting the frame's video in two: drawing the layers, and mixing them into the screen ---
           # s32_video_draw_frame is the biggest item in the Vita's log and nothing says where inside it the time
