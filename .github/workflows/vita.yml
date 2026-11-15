@@ -594,6 +594,7 @@ jobs:
           	console_window_settings.sound_cushion = true;
           	console_window_settings.low_lag = true;    /* (ZERO INPUT LAG: on unless the player turned it off) */
           	console_window_settings.crt_blend = true;  /* (CRT BLEND: what the game shows every other frame, half seen, as on the cabinet's screen) */
+          	console_window_settings.sensitivity = 3;   /* (OPTIONS > STEERING: the Vita's stick has a short throw; softer about the centre, full lock still at its edge) */
           #endif
           	load_window_settings();""")
 
