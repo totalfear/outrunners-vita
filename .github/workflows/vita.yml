@@ -300,8 +300,8 @@ jobs:
              hear move), and gently, so it never warbles. When the queue does run dry -- the game stalled for
              longer than the cushion -- that is a short gap, and the cushion is put back as silence, rather than
              the music sliding down in pitch. (It used to be stretched up to three times slow to fill any gap:
-             a slide of more than an octave, and seconds to come back.) stretch.txt 0: no nudging at all */
-          static bool resample_stretch = true;
+             a slide of more than an octave, and seconds to come back.) OPTIONS > VIDEO > AUDIO PITCH EXACT
+             (console_window_settings.sound_cushion false): no nudging at all, the board's own pitch */
           static uint32_t resample_step;       /* 16.16, nudged each frame; 0 until the first one */
           #define RESAMPLE_CUSHION_FRAMES 9u   /* 9 frames of 1/60 s: 150 ms */
 
@@ -337,7 +337,7 @@ jobs:
           			left -= bytes;
           		}
           	}
-          	if (resample_stretch)
+          	if (console_window_settings.sound_cushion)
           	{
           		/* a smaller step means more samples out of the same mix (the queue fills, the pitch drops a
           		   hair), a larger one fewer. The step is aimed at 2% slow when the queue is under half the
@@ -544,41 +544,33 @@ jobs:
 
           # The picture: WIDE 16:9 (398 of the video's 416 columns at 224 rows: the Vita's 960 x 544 is about
           # 16:9), filling the screen where 4:3 left black at its sides, and bilinear pixels (one pass on the GPU:
-          # smooth's extra pass cost about 3.7 ms a frame and the race dropped to 48-57 fps). Two small files in the
-          # game's folder change them: wide.txt 0 the game's 4:3; pixels.txt 0 sharp, 1 smooth, 2 bilinear, 3 CRT
-          edit("picture files", 'wide.txt',
+          # smooth's extra pass cost about 3.7 ms a frame and the race dropped to 48-57 fps). The Vita has
+          # OPTIONS > VIDEO (console/menu.c, the edits below): PIXELS, WIDE (16:9 or the game's 4:3), AUDIO PITCH
+          # and LOW LAG, kept in outrunners.ini with the rest of OPTIONS. Here the picture is only held to what
+          # the Vita can show: WIDE 16:9 or off
+          edit("picture from options", 'OPTIONS > VIDEO on the Vita',
           """#else
           	console_window_settings.wide = WIDE_OFF;
           #endif
           	console_window_settings.pixels = PIXELS_SMOOTH;""",
           """#elif defined(__vita__)
+          	/* (OPTIONS > VIDEO on the Vita: PIXELS as chosen, WIDE 16:9 or the game's 4:3, console/menu.c) */
+          	if (console_window_settings.wide != WIDE_OFF)
+          		console_window_settings.wide = WIDE_16_9;
           	{
-          		static int vita_wide = -1, vita_pixels = PIXELS_BILINEAR;
+          		static int logged_wide = -1, logged_pixels = -1, logged_pitch = -1;
 
-          		if (vita_wide < 0)
+          		if (logged_wide != console_window_settings.wide || logged_pixels != console_window_settings.pixels
+          			|| logged_pitch != (int)console_window_settings.sound_cushion)
           		{
           			static const char *const kinds[PIXELS_KINDS] = { "sharp", "smooth", "bilinear", "CRT" };
-          			int value;
-          			FILE *file = fopen(VITA_FOLDER "/wide.txt", "r");
 
-          			vita_wide = 1;
-          			if (file)
-          			{
-          				if (fscanf(file, "%d", &value) == 1)
-          					vita_wide = value != 0;
-          				fclose(file);
-          			}
-          			file = fopen(VITA_FOLDER "/pixels.txt", "r");
-          			if (file)
-          			{
-          				if (fscanf(file, "%d", &value) == 1 && value >= 0 && value < PIXELS_KINDS)
-          					vita_pixels = value;
-          				fclose(file);
-          			}
-          			fprintf(stderr, "picture: %s, %s pixels\\n", vita_wide ? "16:9" : "4:3", kinds[vita_pixels]);
+          			logged_wide = console_window_settings.wide;
+          			logged_pixels = console_window_settings.pixels;
+          			logged_pitch = console_window_settings.sound_cushion;
+          			fprintf(stderr, "picture: %s, %s pixels; audio pitch %s\\n", logged_wide == WIDE_OFF ? "4:3" : "16:9",
+          				kinds[logged_pixels], logged_pitch ? "auto (a 150 ms cushion, within 2%)" : "exact");
           		}
-          		console_window_settings.wide = vita_wide ? WIDE_16_9 : WIDE_OFF;
-          		console_window_settings.pixels = vita_pixels;
           	}
           #else
           	console_window_settings.wide = WIDE_OFF;
@@ -586,6 +578,40 @@ jobs:
           #ifndef __vita__
           	console_window_settings.pixels = PIXELS_SMOOTH;
           #endif""")
+
+          # What the Vita starts with before outrunners.ini has said otherwise (a first start): 16:9, bilinear,
+          # the sound's cushion, and the overlap (LOW LAG off)
+          edit("options defaults", "the Vita's own defaults",
+          """	snprintf(settings_path, sizeof(settings_path), "%s" FILE_NAME ".ini", saves ? saves : "");
+          	load_window_settings();""",
+          """	snprintf(settings_path, sizeof(settings_path), "%s" FILE_NAME ".ini", saves ? saves : "");
+          #ifdef __vita__
+          	/* (the Vita's own defaults, until outrunners.ini says otherwise: OPTIONS > VIDEO) */
+          	console_window_settings.wide = WIDE_16_9;
+          	console_window_settings.pixels = PIXELS_BILINEAR;
+          	console_window_settings.sound_cushion = true;
+          	console_window_settings.low_lag = false;
+          #endif
+          	load_window_settings();""")
+
+          edit("options saved", 'sound_cushion=%d',
+          """		settings->centring, settings->vibration, settings->phone_vibration, settings->both_radios);
+          	fclose(output);""",
+          """		settings->centring, settings->vibration, settings->phone_vibration, settings->both_radios);
+          #ifdef __vita__
+          	fprintf(output, "sound_cushion=%d\\nlow_lag=%d\\n", settings->sound_cushion, settings->low_lag);
+          #endif
+          	fclose(output);""")
+
+          edit("options loaded", 'sscanf(line, "sound_cushion=%d"',
+          """		else if (sscanf(line, "pixels=%31s", text) == 1)""",
+          """#ifdef __vita__
+          		else if (sscanf(line, "sound_cushion=%d", &number) == 1)
+          			settings->sound_cushion = number != 0;
+          		else if (sscanf(line, "low_lag=%d", &number) == 1)
+          			settings->low_lag = number != 0;
+          #endif
+          		else if (sscanf(line, "pixels=%31s", text) == 1)""")
 
           edit("frame skip variable", 'static int vita_frame_skip;',
           """#ifdef ORUNNERS_HANDHELD
@@ -607,7 +633,7 @@ jobs:
           # lists the board sends go to the workers the same way. The picture is ended when the next VBLANK
           # starts, core 0 taking what rows are left, and shown then: a frame costs about the larger of the two
           # rather than their sum, and the picture reaches the screen one VBLANK later than it did.
-          # overlap.txt 0 in the game's folder turns it off (the frame is then drawn and shown as it was)
+          # OPTIONS > VIDEO > LOW LAG turns it off from the next start (the frame is then drawn and shown as it was)
           edit("overlap variables", 'static bool vita_overlap',
           """/* The frames drawn into the window */
           static void show_screens(void)
@@ -616,6 +642,7 @@ jobs:
           static bool vita_frame_begun;       /* a frame's video is begun, and not shown yet */
           static bool vita_begin_wanted;      /* on_frame_shown: show_screens begins this frame's video once the texture has the last one */
           static uint64_t vita_begin_time;    /* what beginning it took, for the log's "its video" */
+          bool orunners_vita_low_lag_started; /* LOW LAG as the game started with it (console/menu.c: a change is for the next start) */
           #endif
 
           /* The frames drawn into the window */
@@ -732,13 +759,6 @@ jobs:
           				vita_frame_skip = value;
           			fclose(file);
           		}
-          		file = fopen(VITA_FOLDER "/stretch.txt", "r");
-          		if (file)
-          		{
-          			if (fscanf(file, "%d", &value) == 1)
-          				resample_stretch = value != 0;
-          			fclose(file);
-          		}
           		/* halfres.txt 1: the picture's layers and mix work out every other column (runtime/src/video.c,
           		   s32_video_set_half_columns), half the detail across for about half their work. Off unless asked */
           		{
@@ -751,23 +771,29 @@ jobs:
           					half_columns = value != 0;
           				fclose(file);
           			}
-          			/* overlap.txt 0: the frame's video drawn and waited for when VBLANK starts, as it was. Unless it says
-          			   so, a frame's video is drawn on the workers' threads while the game runs its next frame
-          			   (s32_video_set_overlap, and on_frame_shown): with no such threads there is nothing to gain */
-          			file = fopen(VITA_FOLDER "/overlap.txt", "r");
+          			/* OPTIONS > VIDEO > LOW LAG (low_lag=1 in outrunners.ini, read here: the workers start before
+          			   the settings are loaded): the frame's video drawn and waited for when VBLANK starts, a frame
+          			   less of lag. Otherwise a frame's video is drawn on the workers' threads while the game runs
+          			   its next frame (s32_video_set_overlap, and on_frame_shown): with no such threads there is
+          			   nothing to gain */
+          			file = fopen(VITA_FOLDER "/" FILE_NAME ".ini", "r");
           			if (file)
           			{
-          				if (fscanf(file, "%d", &value) == 1)
-          					vita_overlap = value != 0;
+          				char line[128];
+
+          				while (fgets(line, sizeof(line), file))
+          					if (sscanf(line, "low_lag=%d", &value) == 1)
+          						orunners_vita_low_lag_started = value != 0;
           				fclose(file);
           			}
+          			vita_overlap = !orunners_vita_low_lag_started;
           			s32_video_set_half_columns(half_columns);
           			s32_workers_start(workers);
           			if (s32_workers_count() == 0)
           				vita_overlap = false;
           			s32_video_set_overlap(vita_overlap);
-          			fprintf(stderr, "frameskip: %d, sound kept at its cushion (150 ms, pitch within 2%%): %s, half columns: %s, overlap: %s\\n", vita_frame_skip,
-          				resample_stretch ? "yes" : "no", half_columns ? "yes" : "no", vita_overlap ? "yes" : "no");
+          			fprintf(stderr, "frameskip: %d, half columns: %s, overlap: %s (LOW LAG %s)\\n", vita_frame_skip,
+          				half_columns ? "yes" : "no", vita_overlap ? "yes" : "no", orunners_vita_low_lag_started ? "on" : "off");
           			if (vita_overlap)
           				fprintf(stderr, "overlap: a frame's video is drawn on the workers while the game runs the next frame. In the lines below "
           					"'its video' is the game's wait for the frame begun a VBLANK ago plus beginning the next (the copy of the board), "
@@ -1005,6 +1031,159 @@ jobs:
           else:
               print("ports/sdl2/main.c: the Vita edits were already in")
           MAIN_EDITS
+          # --- OPTIONS > VIDEO on the Vita (console/console.h, console/menu.c) ------------------------------------
+          # A handheld build has no VIDEO page (its picture fixed). The Vita's has one of its own: PIXELS, WIDE
+          # (16:9 or the game's 4:3), AUDIO PITCH (AUTO: the sound's 150 ms cushion, kept by nudging the pitch up
+          # to 2%; EXACT: the board's own pitch, a gap if the game falls behind) and LOW LAG (no overlap: a frame
+          # less between the buttons and the screen, from the next start). Kept in outrunners.ini (main.c, above)
+          python3 - <<'OPTIONS_EDITS'
+          import re, sys
+
+          def norm(t):
+              return re.sub(r"\s+", " ", t)
+
+          def pattern(old):
+              body = r"\s+".join(re.escape(t) for t in old.split())
+              return re.compile(r"(?m)^[ \t]*" + body + (r"[ \t]*\n" if old.endswith("\n") else ""))
+
+          FILES = {"console/console.h": [], "console/menu.c": []}
+          def edit(path, name, marker, old, new):
+              FILES[path].append((name, marker, old, new))
+
+          edit("console/console.h", "the Vita's settings", 'bool low_lag;',
+          """	bool changed;
+          } console_window;""",
+          """	bool changed;
+          #ifdef __vita__
+          	bool sound_cushion;    /* OPTIONS > VIDEO > AUDIO PITCH (the Vita's): AUTO, the sound's cushion kept by nudging the pitch up to 2% (false: EXACT) */
+          	bool low_lag;          /* OPTIONS > VIDEO > LOW LAG (the Vita's): no overlap, a frame less of lag, from the next start */
+          #endif
+          } console_window;""")
+
+          edit("console/menu.c", "VIDEO in OPTIONS", '!defined(ORUNNERS_HANDHELD) || defined(__vita__)',
+          """#ifndef ORUNNERS_HANDHELD
+          	OPTIONS_VIDEO,
+          #endif""",
+          """#if !defined(ORUNNERS_HANDHELD) || defined(__vita__)
+          	OPTIONS_VIDEO,    /* (the Vita's: a page of its own, vita_video_frame) */
+          #endif""")
+
+          edit("console/menu.c", "the Vita's VIDEO lines", 'VITA_VIDEO_ITEMS };',
+          """enum { VIDEO_WINDOW, VIDEO_FULL_SCREEN, VIDEO_PIXELS, VIDEO_WIDE, VIDEO_VSYNC, VIDEO_TWO_PLAYERS, VIDEO_BACK,
+          	VIDEO_ITEMS };""",
+          """enum { VIDEO_WINDOW, VIDEO_FULL_SCREEN, VIDEO_PIXELS, VIDEO_WIDE, VIDEO_VSYNC, VIDEO_TWO_PLAYERS, VIDEO_BACK,
+          	VIDEO_ITEMS };
+          #ifdef __vita__
+          /* the Vita's VIDEO: its picture, its sound's pitch and its lag (vita_video_frame) */
+          enum { VITA_PIXELS, VITA_WIDE, VITA_PITCH, VITA_LOW_LAG, VITA_BACK, VITA_VIDEO_ITEMS };
+          #endif""")
+
+          edit("console/menu.c", "the Vita's VIDEO count", 'return VITA_VIDEO_ITEMS;',
+          """		case PAGE_VIDEO: return VIDEO_ITEMS;""",
+          """#ifdef __vita__
+          		case PAGE_VIDEO: return VITA_VIDEO_ITEMS;
+          #else
+          		case PAGE_VIDEO: return VIDEO_ITEMS;
+          #endif""")
+
+          edit("console/menu.c", "the Vita's VIDEO page", 'static void vita_video_frame(uint32_t pressed)',
+          """/* A force's value on STEERING: its percent, OFF at 0 */""",
+          """#ifdef __vita__
+          extern bool orunners_vita_low_lag_started;    /* (ports/sdl2/main.c: LOW LAG as the game started) */
+
+          /* The Vita's VIDEO: PIXELS, WIDE (16:9 or the game's 4:3), AUDIO PITCH and LOW LAG. The picture and the
+             pitch change at once; LOW LAG at the next start (the overlap is set up as the game starts) */
+          static void vita_video_frame(uint32_t pressed)
+          {
+          	console_window *window = &console_window_settings;
+          	char value[24];
+          	const int by = change(pressed);
+          	const bool accept = (pressed & ACTION_BIT(ACTION_ACCEPT)) != 0;
+
+          	if (by || accept)
+          		switch (menu.choice)
+          		{
+          			case VITA_PIXELS:
+          				window->pixels = step(window->pixels, by ? by : 1, 0, PIXELS_KINDS - 1);
+          				window->changed = true;
+          				break;
+          			case VITA_WIDE:
+          				window->wide = window->wide == WIDE_OFF ? WIDE_16_9 : WIDE_OFF;
+          				window->changed = true;
+          				break;
+          			case VITA_PITCH:
+          				window->sound_cushion = !window->sound_cushion;
+          				window->changed = true;
+          				break;
+          			case VITA_LOW_LAG:
+          				window->low_lag = !window->low_lag;
+          				window->changed = true;
+          				break;
+          			case VITA_BACK:
+          				if (accept)
+          				{
+          					open_page(PAGE_OPTIONS, menu.options_choice);
+          					return;
+          				}
+          				break;
+          		}
+          	page_heading("VIDEO");
+          	snprintf(value, sizeof(value), "< %s >", pixel_kinds[window->pixels]);
+          	line(VITA_PIXELS, "PIXELS", value);
+          	line(VITA_WIDE, "WIDE", window->wide == WIDE_OFF ? "< 4:3 >" : "< 16:9 >");
+          	line(VITA_PITCH, "AUDIO PITCH", window->sound_cushion ? "< AUTO >" : "< EXACT >");
+          	if (window->low_lag == orunners_vita_low_lag_started)
+          		line(VITA_LOW_LAG, "LOW LAG", window->low_lag ? "< ON >" : "< OFF >");
+          	else
+          		line(VITA_LOW_LAG, "LOW LAG", window->low_lag ? "< ON NEXT START >" : "< OFF NEXT START >");
+          	line(VITA_BACK, "BACK", NULL);
+          	darken_page();
+          }
+          #endif
+
+          /* A force's value on STEERING: its percent, OFF at 0 */""")
+
+          edit("console/menu.c", "the Vita's VIDEO frame", 'vita_video_frame(pressed); break;',
+          """		case PAGE_VIDEO: video_frame(pressed); break;""",
+          """#ifdef __vita__
+          		case PAGE_VIDEO: vita_video_frame(pressed); break;
+          #else
+          		case PAGE_VIDEO: video_frame(pressed); break;
+          #endif""")
+
+          failed = False
+          for path, edits in FILES.items():
+              s = open(path, encoding="utf-8", newline="").read()
+              orig = s
+              nl = "\r\n" if "\r\n" in s else "\n"
+              s = s.replace("\r\n", "\n")
+              problems = []
+              for name, marker, old, new in edits:
+                  if norm(marker) in norm(s):
+                      print("  %s: already in" % name)
+                      continue
+                  pat = pattern(old)
+                  found = pat.findall(s)
+                  if len(found) != 1:
+                      problems.append("%s: the text to change was found %d times (wanted 1)" % (name, len(found)))
+                      continue
+                  s = pat.sub(lambda m: new, s, count=1)
+                  print("  %s: added" % name)
+              if problems:
+                  print("%s does not look as expected:" % path)
+                  for p in problems:
+                      print("  -", p)
+                  failed = True
+                  continue
+              s = s.replace("\n", nl)
+              if s != orig:
+                  open(path, "w", encoding="utf-8", newline="").write(s)
+                  print("%s: the Vita edits are in" % path)
+              else:
+                  print("%s: the Vita edits were already in" % path)
+          if failed:
+              sys.exit(1)
+          OPTIONS_EDITS
           python3 - <<'TASKS_EDITS'
           import re, sys
 
