@@ -41,14 +41,49 @@ typedef CondVar pool_signal;
 #define WAIT(signal, lock) condvarWait(signal, lock)
 #define WAKE_ALL(signal) condvarWakeAll(signal)
 #else
+#include <errno.h>
 #include <pthread.h>
+#include <sys/time.h>
 typedef pthread_mutex_t pool_lock;
 typedef pthread_cond_t pool_signal;
 #define LOCK(lock) pthread_mutex_lock(lock)
 #define UNLOCK(lock) pthread_mutex_unlock(lock)
-#define WAIT(signal, lock) pthread_cond_wait(signal, lock)
 #define WAKE_ALL(signal) pthread_cond_broadcast(signal)
+#define WAITS_TIMED
+
+/* A wait that looks again after 2 ms however it went, true if it was the time that ended it. Every wait here
+   is in a loop that checks what it waits for, so a wake-up the system loses costs 2 ms and not the game: the
+   Vita's game froze at random, at 60 frames a second and with nothing in its log, once the frame's video
+   became the workers' tasks and three threads waited on the one signal */
+static bool wait_timed(pool_signal *signal, pool_lock *lock)
+{
+	struct timeval now;
+	struct timespec until;
+
+	gettimeofday(&now, NULL);
+	until.tv_sec = now.tv_sec;
+	until.tv_nsec = (long)now.tv_usec * 1000 + 2000000;
+	if (until.tv_nsec >= 1000000000)
+	{
+		until.tv_sec++;
+		until.tv_nsec -= 1000000000;
+	}
+	return pthread_cond_timedwait(signal, lock, &until) == ETIMEDOUT;
+}
 #endif
+#ifndef WAITS_TIMED
+static bool wait_timed(pool_signal *signal, pool_lock *lock)
+{
+	WAIT(signal, lock);
+	return false;
+}
+#endif
+#include <stdio.h>
+#include <time.h>
+
+/* (for a port's log: the waits that ended on their time, and of those the ones that found what they waited
+   for already there, a wake-up lost; read and put back to 0 by whoever reads them) */
+unsigned long s32_workers_waits_timed_out, s32_workers_wakeups_lost;
 
 #define WORKERS_MOST 7
 #define TASKS_MOST   8    /* queued and not done: one more waits for the oldest */
@@ -122,13 +157,32 @@ static bool take_task(void)
 	return true;
 }
 
+/* There are rows to take, or a task that can be taken. The lock is held */
+static bool work_waiting(void)
+{
+	return pool.next <= pool.last || (pool.started != pool.queued && pool.started == pool.done);
+}
+
+/* A wait on the pool's signal for a thread that waits while 'still' holds, the lock held: a wait the time
+   ended that finds it no longer holds, or work to take, missed a wake-up */
+#define WAIT_WHILE(still) \
+	do \
+	{ \
+		if (wait_timed(&pool.changed, &pool.lock)) \
+		{ \
+			s32_workers_waits_timed_out++; \
+			if (!(still) || work_waiting()) \
+				s32_workers_wakeups_lost++; \
+		} \
+	} while (0)
+
 static void worker_loop(int number)
 {
 	(void)number;
 	LOCK(&pool.lock);
 	for (;;)
 		if (!take_rows() && !take_task())
-			WAIT(&pool.changed, &pool.lock);
+			WAIT_WHILE(true);
 }
 
 #if defined(_WIN32)
@@ -205,7 +259,7 @@ void s32_workers_rows_by(s32_rows_work work, void *context, int first, int last,
 	}
 	LOCK(&pool.lock);
 	while (pool.next <= pool.last || pool.taking > 0)
-		WAIT(&pool.changed, &pool.lock);    /* (one job at a time: another thread's is let finish first) */
+		WAIT_WHILE(pool.next <= pool.last || pool.taking > 0);    /* (one job at a time: another thread's is let finish first) */
 	pool.work = work;
 	pool.context = context;
 	pool.next = first;
@@ -215,7 +269,7 @@ void s32_workers_rows_by(s32_rows_work work, void *context, int first, int last,
 	while (take_rows())
 		;
 	while (pool.taking > 0)
-		WAIT(&pool.changed, &pool.lock);
+		WAIT_WHILE(pool.taking > 0 && !work_waiting());
 	UNLOCK(&pool.lock);
 }
 
@@ -245,7 +299,7 @@ unsigned s32_workers_queue(s32_task_work work, void *context)
 	LOCK(&pool.lock);
 	while (pool.queued - pool.done == TASKS_MOST)
 		if (!take_rows() && !take_task())
-			WAIT(&pool.changed, &pool.lock);
+			WAIT_WHILE(pool.queued - pool.done == TASKS_MOST);
 	number = ++pool.queued;
 	pool.tasks[number % TASKS_MOST].work = work;
 	pool.tasks[number % TASKS_MOST].context = context;
@@ -270,9 +324,25 @@ void s32_workers_finish(unsigned number)
 		return;
 	}
 	LOCK(&pool.lock);
-	while ((int)(pool.done - number) < 0 && pool.done != pool.queued)
-		if (!take_rows() && !take_task())
-			WAIT(&pool.changed, &pool.lock);
+	{
+		const time_t since = time(NULL);
+		bool told = false;
+
+		while ((int)(pool.done - number) < 0 && pool.done != pool.queued)
+			if (!take_rows() && !take_task())
+			{
+				WAIT_WHILE((int)(pool.done - number) < 0 && pool.done != pool.queued);
+				/* (seconds of this are a game stuck: what the pool holds goes to the log, once) */
+				if (!told && time(NULL) - since >= 3)
+				{
+					told = true;
+					fprintf(stderr, "workers: waited seconds for task %u: queued %u, started %u, done %u, rows %d to %d"
+						" (step %d), %d threads at rows, %d threads\n", number, pool.queued, pool.started, pool.done,
+						pool.next, pool.last, pool.step, pool.taking, pool.count);
+					fflush(stderr);
+				}
+			}
+	}
 	UNLOCK(&pool.lock);
 }
 

@@ -742,6 +742,15 @@ jobs:
           			s32_video_pace_sprites = 0;
           		}
           		{
+          			/* (runtime/src/workers.c: its waits look again every 2 ms; a lost wake-up is one that found what it
+          			   waited for already there, which would have been a frozen game) */
+          			extern unsigned long s32_workers_waits_timed_out, s32_workers_wakeups_lost;
+
+          			fprintf(stderr, "  workers: %lu waits ended on their time, %lu of them wake-ups lost\\n",
+          				s32_workers_waits_timed_out, s32_workers_wakeups_lost);
+          			s32_workers_waits_timed_out = s32_workers_wakeups_lost = 0;
+          		}
+          		{
           			/* (runtime/src/machine.c: how often the game reached the board, a frame) */
           			extern uint64_t s32_io_reads, s32_io_writes;
 
