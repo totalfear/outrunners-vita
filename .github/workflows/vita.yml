@@ -786,9 +786,13 @@ jobs:
           ""","""#ifdef __vita__
           	bool skipped;    /* (frames not drawn: frameskip.txt) */
           	{
+          		/* (and every other one while OPTIONS' pages are open: their shadow over the whole screen costs the
+          		   picture as much again, and they change 30 times a second over the title held still) */
+          		extern bool console_vita_options_shown(void);    /* (console/menu.c) */
           		static unsigned frame_count;
+          		const int skip = vita_frame_skip < 1 && console_vita_options_shown() ? 1 : vita_frame_skip;
 
-          		skipped = vita_frame_skip > 0 && frame_count++ % ((unsigned)vita_frame_skip + 1) != 0;
+          		skipped = skip > 0 && frame_count++ % ((unsigned)skip + 1) != 0;
           		if (skipped && !(vita_overlap && vita_frame_begun))
           			return;    /* (with overlap, the frame begun a VBLANK ago is still shown: below) */
           	}
@@ -1379,15 +1383,23 @@ jobs:
           		case PAGE_VIDEO: video_frame(pressed); break;
           #endif""")
 
-          # The pages' backdrop on the Vita: black, not the see-through shadow. A shadow over the whole screen
-          # is drawn and mixed the long way, a pixel at a time (the Vita's log: the picture's rows 4.0 -> 7.8 ms,
-          # the sprites 1 -> 4.3 ms, OPTIONS at 45 frames a second); a black one takes the short way
-          edit("console/menu.c", "the Vita's pages on black", 'console_black(-side, 0, SCREEN_WIDTH + 2 * side, 224)',
-          """	console_shade(-side, 0, SCREEN_WIDTH + 2 * side, 224);""",
-          """#ifdef __vita__
-          	console_black(-side, 0, SCREEN_WIDTH + 2 * side, 224);    /* (the Vita's pages on black: a shadow costs it 15 frames a second) */
-          #else
-          	console_shade(-side, 0, SCREEN_WIDTH + 2 * side, 224);
+          # OPTIONS' pages shown, for the Vita's picture: their shadow over the whole screen is drawn and mixed
+          # the long way, a pixel at a time (the Vita's log: the picture's rows 4.0 -> 7.8 ms, the sprites 1 ->
+          # 4.3 ms, 45 frames a second). The pages change 30 times a second over the title held still, so the
+          # Vita draws the picture every other frame while one is open (ports/sdl2/main.c, frame skip). (Black
+          # instead was worse: its own colour marks every pixel, and the marks take the long way too)
+          edit("console/menu.c", "OPTIONS shown for the Vita", 'bool console_vita_options_shown(void)',
+          """		|| page == PAGE_STEERING || page == PAGE_INPUT_TEST || page == PAGE_WHEEL_SETUP || page == PAGE_CONTROLS;
+          }""",
+          """		|| page == PAGE_STEERING || page == PAGE_INPUT_TEST || page == PAGE_WHEEL_SETUP || page == PAGE_CONTROLS;
+          }
+
+          #ifdef __vita__
+          /* (one of them open: the Vita draws the picture every other frame then, ports/sdl2/main.c) */
+          bool console_vita_options_shown(void)
+          {
+          	return options_page(menu.page);
+          }
           #endif""")
 
           failed = False
