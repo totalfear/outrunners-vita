@@ -458,7 +458,7 @@ static bool text_cell_blank(uint16_t control, uint16_t cell, int line)
 	const uint32_t at = ((uint32_t)(control & 7) << 9 | (cell & 0x1ff)) * 32 + (uint32_t)line * 4;
 	uint32_t pens;
 
-	memcpy(&pens, &s32_board.video_ram[at & (S32_VIDEO_RAM_SIZE - 1)], sizeof(pens));
+	memcpy(&pens, &seen.video_ram[at & (S32_VIDEO_RAM_SIZE - 1)], sizeof(pens));
 	return pens == 0;
 }
 
@@ -1164,7 +1164,7 @@ static bool covers(int above, int below)
 		const uint16_t upper = mixer_register(screen, 0x20 + 2 * (uint32_t)above);
 		const uint16_t lower = mixer_register(screen, 0x20 + 2 * (uint32_t)below);
 
-		if (!bit((uint32_t)video.screens_shown, screen) || !s32_display_enabled(screen) || (lower & 0x0f) == 0)
+		if (!bit((uint32_t)video.screens_shown, screen) || !seen.display_enabled[screen] || (lower & 0x0f) == 0)
 			continue;
 		if (layer_rank(upper, above) < layer_rank(lower, below))
 			return false;
@@ -1206,7 +1206,7 @@ static int draw_layers(int wanted)
 				observe_tilemap(number);
 
 	while (first_screen < S32_SCREENS - 1 &&
-		!(bit((uint32_t)video.screens_shown, first_screen) && s32_display_enabled(first_screen)))
+		!(bit((uint32_t)video.screens_shown, first_screen) && seen.display_enabled[first_screen]))
 		first_screen++;
 	for (int index = LAYER_TEXT; index <= LAYER_BITMAP; index++)
 	{
