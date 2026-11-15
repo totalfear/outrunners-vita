@@ -514,7 +514,8 @@ jobs:
           """)
 
           # The picture: WIDE 16:9 (398 of the video's 416 columns at 224 rows: the Vita's 960 x 544 is about
-          # 16:9), filling the screen where 4:3 left black at its sides, and smooth pixels. Two small files in the
+          # 16:9), filling the screen where 4:3 left black at its sides, and bilinear pixels (one pass on the GPU:
+          # smooth's extra pass cost about 3.7 ms a frame and the race dropped to 48-57 fps). Two small files in the
           # game's folder change them: wide.txt 0 the game's 4:3; pixels.txt 0 sharp, 1 smooth, 2 bilinear, 3 CRT
           edit("picture files", 'wide.txt',
           """#else
@@ -523,7 +524,7 @@ jobs:
           	console_window_settings.pixels = PIXELS_SMOOTH;""",
           """#elif defined(__vita__)
           	{
-          		static int vita_wide = -1, vita_pixels = PIXELS_SMOOTH;
+          		static int vita_wide = -1, vita_pixels = PIXELS_BILINEAR;
 
           		if (vita_wide < 0)
           		{
